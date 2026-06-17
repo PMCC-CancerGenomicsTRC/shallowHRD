@@ -1,14 +1,120 @@
 # shallowHRD
 
-This method uses shallow Whole Genome Sequencing (sWGS > 0.3x) and the segmentation of a tumor genomic profile to infer the Homologous Recombination status of a breast and ovarian tumor based on the number of Large-scale Genomic Alterations (LGAs), evaluated in a similar way to LSTs (Large-scale State Transitions) but independent of the ploidy, with no reference to an absolute copy number. This can also be applied to pancreatic and prostate tumor.
+> **Note:** This is a forked repository with added support for custom gene lists. See "Custom Gene List Support" section below. For the original shallowHRD implementation, see the [primary repository](https://github.com/aeeckhou/shallowHRD).
+
+## Fork Attribution
+
+This fork extends the original **shallowHRD** software with data-driven gene list support. Original credit:
+
+- **Original Authors & Publication:** Popova et al. (2012); Eeckhoutte et al.
+- **Original Repository:** [aeeckhou/shallowHRD](https://github.com/aeeckhou/shallowHRD)
+- **This Fork:** PMCC-CancerGenomicsTRC/shallowHRD (feat/custom-scna-gene-list branch)
+
+### Modifications in This Fork
+
+- **Custom gene list support**: Replaces hard-coded gene annotations with external, user-provided gene lists
+- **Data-driven workflow**: Gene-specific metrics are now generated programmatically
+- **Enhanced validation**: Comprehensive checks for input gene list format and chromosome values
+- **Backward compatibility**: Falls back to built-in 60-gene default when no custom list is provided
+
+---
+
+## Custom Gene List Support
+
+### Quick Start
+
+**Using the default gene list (original behavior):**
+```bash
+Rscript shallowHRD_hg19_1.13_QDNAseq_no_chrX.R \
+  input_ratio.txt \
+  output_directory \
+  cytoband_file.txt
+```
+
+**Using a custom gene list:**
+```bash
+Rscript shallowHRD_hg19_1.13_QDNAseq_no_chrX.R \
+  input_ratio.txt \
+  output_directory \
+  cytoband_file.txt \
+  custom_genes.tsv
+```
+
+### Input Gene List Format
+
+Provide a tab- or comma-delimited file with header row. Choose one of:
+
+**Option A: Single representative coordinate per gene**
+```
+gene    chr    position
+BRCA1   17     41236847
+BRCA2   13     32932025
+TP53    17     7581274
+```
+
+**Option B: Gene interval (start/end) — midpoint is derived automatically**
+```
+gene    chr    start      end
+BRCA1   17     41196312   41277381
+BRCA2   13     32889645   32974405
+TP53    17     7571739    7590808
+```
+
+### Input Validation
+
+- ✓ Chromosomes: numeric (1-22, 23 for X, 24 for Y) or "chr1"-"chr22", "chrX", "chrY"
+- ✓ Positions: numeric, ≥ 1 bp
+- ✓ Delimiter: auto-detected (tab or comma)
+- ✓ Duplicates: detected and warned
+- ✓ Missing values: detected and reported
+
+### Output
+
+Same output structure as original:
+- **File**: `amplification_deletion_table.txt`
+- **Columns**: gene, chr, start, ratio_point_initial, CN_to_baseline_point_initial, ratio_segment_initial, CN_to_baseline_segment_initial, ratio_segment_final, **CN_to_baseline_segment_final** (final CN value)
+- **One row per gene**
+
+### Implementation
+
+- **`gene_list_utils.R`**: Utility functions for loading, validating, and processing gene lists
+- **`shallowHRD_hg19_1.13_QDNAseq_no_chrX.R`**: Updated main script (now sources gene_list_utils.R)
+
+### Example: Creating a Custom Gene List
+
+```r
+# Minimal HRD panel
+hrd_genes <- data.frame(
+  gene = c("BRCA1", "BRCA2", "RAD51C", "PTEN"),
+  chr = c(17, 13, 17, 10),
+  position = c(41236847, 32932025, 56790924, 89677535)
+)
+
+write.table(hrd_genes, "hrd_genes.tsv", sep="\t", quote=FALSE, row.names=FALSE)
+```
+
+Then run:
+```bash
+Rscript shallowHRD_hg19_1.13_QDNAseq_no_chrX.R ratio.txt output/ cytoband.txt hrd_genes.tsv
+```
+
+### Full Documentation
+
+For comprehensive details on the custom gene list feature, validation rules, troubleshooting, and examples, see [CUSTOM_GENE_LIST.md](CUSTOM_GENE_LIST.md).
+
+---
+
+# shallowHRD (Original Documentation)
+
+This method uses shallow Whole Genome Sequencing (sWGS > 0.3x) and the segmentation of a tumor genomic profile to infer the Homologous Recombination status of a breast and ovarian tumor based on th[...]
 
 ## Introduction
 
-*shallowHRD* is a R script that can be launched from the command line. It relies on a ratio file characterizing the normalized read counts of a shallow Whole Genome Sequencing (>0.3x) in sliding windows along the genome and its segmentation. It was developped on the output of [ControlFREEC](http://boevalab.inf.ethz.ch/FREEC/tutorial.html) ([Boeva,V. et al., 2012](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3268243/)) but is adapted to similar softwares. We recommand now to use [QDNAseq](https://github.com/ccagc/QDNAseq) with 50kb windows (see QDNAseq_script_chrX). A script is also provided for ControlFREEC output. Adaptation to other tools are however possible by matching the required input format (see sections "run shallowHRD" and "Nota Bene").
+*shallowHRD* is a R script that can be launched from the command line. It relies on a ratio file characterizing the normalized read counts of a shallow Whole Genome Sequencing (>0.3x) in sliding wi[...]
 
-Softwares such as QDNAseq count reads in sliding windows, normalize read count and then segment the genomic profile. *shallowHRD*, based on a inferred CNA cut-off representing a one copy difference, will smooth the segmentation in a step wise manner, using first large segments, reintegrating small segments afterwards and then filtering small interstitial CNAs. The profile is optimised two times for a more robust output and the inferred CNA cut-off is each time based on simulations. The HR status is estimated based on the number of Large-scale Genomic Alterations (LGAs) i.e. intra-chromosome arm CNA breaks along the genome. 
+Softwares such as QDNAseq count reads in sliding windows, normalize read count and then segment the genomic profile. *shallowHRD*, based on a inferred CNA cut-off representing a one copy difference[...]
 
-**IMPORTANT : This GitHub contains the *first* version of *shallowHRD* (v1.13). Since its publication, the software has been under continuous developpement and the *shallowHRDv2* has been published in Oncogene on November 2023. It improves *shallowHRD* by (i) securing correct estimation of LGA by managing specific noise and (ii) minimizing not conclusive diagnostics by resolving borderline cases. It has been validated against the PAOLA-1/ENGOT-OV25 phase-III trial and is highly recommended for diagnosis. <br/>
+**IMPORTANT : This GitHub contains the *first* version of *shallowHRD* (v1.13). Since its publication, the software has been under continuous developpement and the *shallowHRDv2* has been publishe[...]
 The version 2.0 is now available under licence. Please contact Marc-Henri Stern : marc-henri.stern@curie.fr** 
 
 ## Requirements
@@ -26,11 +132,11 @@ Tested on Linux, Mac and Windows.
 
 ## Prerequisities
 
-First, FASTQ files should be aligned to a reference genome (hg19 or hg38) (using [BWA-MEM](https://github.com/lh3/bwa) for instance) and supplementary & duplicate reads removed from the BAM files, using [Samtools](http://www.htslib.org/doc/samtools.html) and [PicardTools' MarkDuplicates](https://broadinstitute.github.io/picard/command-line-overview.html#MarkDuplicates), respectively.
+First, FASTQ files should be aligned to a reference genome (hg19 or hg38) (using [BWA-MEM](https://github.com/lh3/bwa) for instance) and supplementary & duplicate reads removed from the BAM files,[...]
 
 **IMPORTANT: Please only use chromosomes 1 to 22 (plus the Chromosome X if you want to) for the alignment step. Additionnal chromosomes (contigs) might introduce errors.**
 
-Then, the BAM file should then be processed by a software such as ControlFREEC. The recommended options for controlFREEC are indicated in a config file example in the repository (*controlfreec_config_file_example_hg19.txt*). The window size was fixed here to 20kb (coverage > 0.4x) and the parameters were set for a sensitive segmentation. The window size can however be increased up to ~60kb if necessary depending on the coverage, with a step size half its length.
+Then, the BAM file should then be processed by a software such as ControlFREEC. The recommended options for controlFREEC are indicated in a config file example in the repository (*controlfreec_con[...]
 
 Finally, the file *cytoBand_adapted_hg19.csv* or *cytoBand_adapted_hg38.csv* (available in the repository) has to be downloaded. 
 
@@ -101,8 +207,8 @@ marc-henri.stern@curie.fr <br/>
 ## Publications
 *shallowHRD* publication :
 
-Alexandre Eeckhoutte, Alexandre Houy, Elodie Manié, Manon Reverdy, Ivan Bièche, Elisabetta Marangoni, Oumou Goundiam, Anne Vincent-Salomon, Dominique Stoppa-Lyonnet, François-Clément Bidard, Marc-Henri Stern, Tatiana Popova. ShallowHRD: Detection of Homologous Recombination Deficiency from shallow Whole Genome Sequencing. Bioinformatics (2020), https://doi.org/10.1093/bioinformatics/btaa261 
+Alexandre Eeckhoutte, Alexandre Houy, Elodie Manié, Manon Reverdy, Ivan Bièche, Elisabetta Marangoni, Oumou Goundiam, Anne Vincent-Salomon, Dominique Stoppa-Lyonnet, François-Clément Bidard, [...]
 
 *shallowHRDv2* publication :
 
-Celine Callens, Manuel Rodrigues, Adrien Briaux, Eleonore Frouin, Alexandre Eeckhoutte, Eric Pujade-Lauraine, Victor Renault, Dominique Stoppa-Lyonnet, Ivan Bieche, Guillaume Bataillon, Lucie Karayan-Tapon, Tristan Rochelle, Florian Heitz, Sabrina Chiara Cecere, Maria Jesús Rubio Pérez, Christoph Grimm, Trine Jakobi Nøttrup, Nicoletta Colombo, Ignace Vergote, Kan Yonemori, Isabelle Ray-Coquard, Marc-Henri Stern & Tatiana Popova. Shallow whole genome sequencing approach to detect Homologous Recombination Deficiency in the PAOLA-1/ENGOT-OV25 phase-III trial. Oncogene (2023), https://doi.org/10.1038/s41388-023-02839-8 
+Celine Callens, Manuel Rodrigues, Adrien Briaux, Eleonore Frouin, Alexandre Eeckhoutte, Eric Pujade-Lauraine, Victor Renault, Dominique Stoppa-Lyonnet, Ivan Bieche, Guillaume Bataillon, Lucie Kar[...]
