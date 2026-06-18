@@ -143,6 +143,7 @@ load_gene_list <- function(custom_path = NULL) {
   custom_genes$chr <- as.numeric(sub("^chr", "", as.character(custom_genes$chr), ignore.case = TRUE))
   custom_genes$start <- as.numeric(custom_genes$start)
   custom_genes <- custom_genes[!is.na(custom_genes$chr) & !is.na(custom_genes$start), ]
+  # Exclude chrX/chrY/chrM; this no-chrX workflow uses autosomes only (chr 1-22)
   custom_genes <- custom_genes[custom_genes$chr >= 1 & custom_genes$chr <= 22, ]
 
   if (nrow(custom_genes) == 0) {
@@ -4146,6 +4147,7 @@ colnames(B) <- c("chr", "start", "end", "ratio", "ratio_median")
 
 B = B[which(B$chr != 23),]
 
+# Plot-only highlighting for key HRD genes (not written to output table)
 hrd_genes <- c("BRCA1", "BRCA2", "RAD51C", "CDKN2AIP", "PIK3CA", "MYC", "CD274_PDL1", "PTEN", "CCND1", "CCNE1", "NF1", "ERBB2")
 amplification_deletion_table$label_color <- ifelse(amplification_deletion_table$gene %in% hrd_genes, "red", "black")
 
