@@ -86,7 +86,42 @@ chr_p<-round(chr_len[,1]/GG,3)
 ##### GENE LIST LOADER #####
 
 load_gene_list <- function(custom_path = NULL) {
-  # Built-in gene list coordinates are hg19 and match shallowHRD assumptions
+  # When a custom path is provided, load ONLY the custom genes.
+  # Do NOT attempt to build the internal list — fail loudly if the custom file is invalid.
+  if (!is.null(custom_path) && nzchar(custom_path)) {
+    if (!file.exists(custom_path)) {
+      stop("Custom gene file not found: ", custom_path)
+    }
+
+    cat("Loading custom gene list from: ", custom_path, "\n", sep = "")
+
+    custom_genes <- tryCatch(
+      read.csv(custom_path, stringsAsFactors = FALSE, strip.white = TRUE),
+      error = function(e) stop("Failed to read custom gene CSV: ", conditionMessage(e))
+    )
+
+    required_cols <- c("gene", "chr", "start")
+    missing_cols <- setdiff(required_cols, colnames(custom_genes))
+    if (length(missing_cols) > 0) {
+      stop("Custom gene CSV missing required columns: ", paste(missing_cols, collapse = ", "))
+    }
+
+    custom_genes <- custom_genes[, required_cols]
+    custom_genes$chr <- as.numeric(sub("^chr", "", as.character(custom_genes$chr), ignore.case = TRUE))
+    custom_genes$start <- as.numeric(custom_genes$start)
+    custom_genes <- custom_genes[!is.na(custom_genes$chr) & !is.na(custom_genes$start), ]
+    # This no-chrX workflow uses autosomes only (chr 1-22)
+    custom_genes <- custom_genes[custom_genes$chr >= 1 & custom_genes$chr <= 22, ]
+
+    if (nrow(custom_genes) == 0) {
+      stop("No valid genes in custom file after filtering to chr 1-22")
+    }
+
+    cat("Using custom gene list with ", nrow(custom_genes), " genes.\n", sep = "")
+    return(custom_genes)
+  }
+
+  # No custom path — use the internal built-in gene list (hg19 coordinates)
   built_in_genes <- data.frame(
     gene = c("DOCK7", "HCN3", "KLHL12", "RBBP5", "TSC22D2", "PIK3CA", "ANKRD17", "CDKN2AIP",
              "RTN4IP1", "AIM1", "INTS10", "PPP2R2A", "BRF2", "ZNF703", "MYC", "CD274_PDL1",
@@ -98,7 +133,7 @@ load_gene_list <- function(custom_path = NULL) {
              "TSHZ2", "SAMD10", "PCNT"),
     chr = c(1, 1, 1, 1, 3, 3, 4, 4, 6, 6, 8, 8, 8, 8, 8, 9, 9, 10, 10, 10, 10,
             11, 11, 11, 11, 11, 11, 12, 12, 12, 12, 13, 13, 13, 14, 15, 15, 16, 17, 17,
-            17, 17, 17, 17, 17, 17, 17, 17, 19, 19, 19, 19, 19, 20, 20, 20, 20, 21),
+            17, 17, 17, 17, 17, 17, 17, 17, 19, 19, 19, 19, 19, 20, 20, 20, 20, 21, 21),
     start = c(63037227, 155253447, 202878988, 205073188, 150155147, 178912013, 74031804,
               184368003, 107048506, 106914242, 19692253, 26189610, 37704083, 37555419,
               128751439, 5460548, 21834858, 13374861, 80828723, 88238281, 89677535,
@@ -111,48 +146,8 @@ load_gene_list <- function(custom_path = NULL) {
     stringsAsFactors = FALSE
   )
 
-  if (is.null(custom_path) || !nzchar(custom_path)) {
-    cat("Using built-in gene list (", nrow(built_in_genes), " genes).\n", sep = "")
-    return(built_in_genes)
-  }
-
-  if (!file.exists(custom_path)) {
-    warning("Custom gene list not found: ", custom_path, ". Falling back to built-in genes.")
-    return(built_in_genes)
-  }
-
-  cat("Loading custom gene list from: ", custom_path, "\n", sep = "")
-
-  custom_genes <- tryCatch(read.csv(custom_path, stringsAsFactors = FALSE),
-                           error = function(e) NULL)
-
-  if (is.null(custom_genes)) {
-    warning("Unable to read custom gene list; falling back to built-in genes.")
-    return(built_in_genes)
-  }
-
-  required_cols <- c("gene", "chr", "start")
-  missing_cols <- setdiff(required_cols, colnames(custom_genes))
-  if (length(missing_cols) > 0) {
-    warning("Missing required custom gene columns: ", paste(missing_cols, collapse = ", "),
-            ". Falling back to built-in genes.")
-    return(built_in_genes)
-  }
-
-  custom_genes <- custom_genes[, required_cols]
-  custom_genes$chr <- as.numeric(sub("^chr", "", as.character(custom_genes$chr), ignore.case = TRUE))
-  custom_genes$start <- as.numeric(custom_genes$start)
-  custom_genes <- custom_genes[!is.na(custom_genes$chr) & !is.na(custom_genes$start), ]
-  # Exclude chrX/chrY/chrM; this no-chrX workflow uses autosomes only (chr 1-22)
-  custom_genes <- custom_genes[custom_genes$chr >= 1 & custom_genes$chr <= 22, ]
-
-  if (nrow(custom_genes) == 0) {
-    warning("No valid custom genes after filtering chr/start; falling back to built-in genes.")
-    return(built_in_genes)
-  }
-
-  cat("Using custom gene list with ", nrow(custom_genes), " genes.\n", sep = "")
-  custom_genes
+  cat("Using built-in gene list (", nrow(built_in_genes), " genes).\n", sep = "")
+  built_in_genes
 }
 
 lookup_gene_ratios <- function(gene_list, B, C, THR) {
@@ -4087,6 +4082,24 @@ amplification_deletion_table = data.frame(
 )
 
 write.table(amplification_deletion_table, file = paste0(outputPath,"/",NAMEEE,"_amplification_deletion_table.txt"), sep = "\t", row.names = FALSE)
+
+# When custom genes were provided, also generate a comparison table using the built-in gene list
+if (!is.null(custom_gene_file) && nzchar(custom_gene_file)) {
+  gene_list_builtin <- load_gene_list(NULL)
+  lookup_gene_table_builtin <- lookup_gene_ratios(gene_list_builtin, B, C, THR)
+  amplification_deletion_table_builtin = data.frame(
+    gene = lookup_gene_table_builtin$gene,
+    chr = lookup_gene_table_builtin$chr,
+    start = lookup_gene_table_builtin$start,
+    ratio_point_initial = lookup_gene_table_builtin$ratio_point_initial,
+    CN_to_baseline_point_initial = lookup_gene_table_builtin$CN_point_initial,
+    ratio_segment_initial = lookup_gene_table_builtin$ratio_segment_initial,
+    CN_to_baseline_segment_initial = lookup_gene_table_builtin$CN_segment_initial,
+    ratio_segment_final = lookup_gene_table_builtin$ratio_segment_final,
+    CN_to_baseline_segment_final = lookup_gene_table_builtin$CN_segment_final
+  )
+  write.table(amplification_deletion_table_builtin, file = paste0(outputPath,"/",NAMEEE,"_amplification_deletion_table_builtin.txt"), sep = "\t", row.names = FALSE)
+}
 
 
 
