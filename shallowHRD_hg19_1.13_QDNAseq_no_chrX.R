@@ -18,6 +18,25 @@ outputPath = normalizePath(output_relative_Path)
 path_to_cyto = args[3]
 cytoFile = normalizePath(path_to_cyto)
 
+# Optional custom gene list path (supports both arg4 and arg5 for compatibility)
+custom_gene_file <- NULL
+if (length(args) >= 5 && nzchar(args[5])) {
+  custom_gene_file <- args[5]
+} else if (length(args) >= 4 && nzchar(args[4])) {
+  custom_gene_file <- args[4]
+}
+
+if (!is.null(custom_gene_file)) {
+  if (file.exists(custom_gene_file)) {
+    cat("Custom gene file detected:", custom_gene_file, "\n")
+  } else {
+    warning("Custom gene file does not exist and will be ignored: ", custom_gene_file)
+    custom_gene_file <- NULL
+  }
+} else {
+  cat("No custom gene file provided; using built-in hg19 gene list.\n")
+}
+
 continue_on_error <- function() { 
   paste() 
 }
@@ -63,6 +82,118 @@ chr_len<-chr_len[-dim(chr_len)[[1]],]
 GG<-sum(chr_len[,1])
 chr_p<-round(chr_len[,1]/GG,3)
 
+
+##### GENE LIST LOADER #####
+
+load_gene_list <- function(custom_path = NULL) {
+  # Built-in gene list coordinates are hg19 and match shallowHRD assumptions
+  built_in_genes <- data.frame(
+    gene = c("DOCK7", "HCN3", "KLHL12", "RBBP5", "TSC22D2", "PIK3CA", "ANKRD17", "CDKN2AIP",
+             "RTN4IP1", "AIM1", "INTS10", "PPP2R2A", "BRF2", "ZNF703", "MYC", "CD274_PDL1",
+             "MTAP", "SEPHS1", "ZMIZ1", "WAPAL", "PTEN", "CSTF3", "BBS1", "CTTN", "CCND1",
+             "ATG16L2", "INTS4", "CCDC77", "FOXM1", "YEATS4", "MDM2", "BRCA2", "C13orf23",
+             "TRIM13", "SDCCAG1", "SNAP23", "IGF1R", "CYB5B", "P53", "ELAC2", "MAP2K4",
+             "ERAL1", "NF1", "ERBB2", "BRCA1", "PHB", "SUPT4H1", "RAD51C", "GALK1",
+             "AKAP8", "BRD4", "PIK3R2", "CCNE1", "NOSIP", "C20orf111", "ZNF217",
+             "TSHZ2", "SAMD10", "PCNT"),
+    chr = c(1, 1, 1, 1, 3, 3, 4, 4, 6, 6, 8, 8, 8, 8, 8, 9, 9, 10, 10, 10, 10,
+            11, 11, 11, 11, 11, 11, 12, 12, 12, 12, 13, 13, 13, 14, 15, 15, 16, 17, 17,
+            17, 17, 17, 17, 17, 17, 17, 17, 19, 19, 19, 19, 19, 20, 20, 20, 20, 21),
+    start = c(63037227, 155253447, 202878988, 205073188, 150155147, 178912013, 74031804,
+              184368003, 107048506, 106914242, 19692253, 26189610, 37704083, 37555419,
+              128751439, 5460548, 21834858, 13374861, 80828723, 88238281, 89677535,
+              33144578, 66289588, 70263658, 69462583, 72533068, 77647740, 525161, 2976593,
+              69769087, 69223209, 32932025, 39598114, 50581891, 50284154, 42806544,
+              99349764, 69479345, 7581274, 12908137, 11985670, 27185057, 29563320,
+              37864629, 41236847, 47486829, 56426497, 56791453, 73754412, 15477397,
+              15394840, 18272658, 30309059, 50071269, 42831995, 52196994, 51850383,
+              62608232, 47804876),
+    stringsAsFactors = FALSE
+  )
+
+  if (is.null(custom_path) || !nzchar(custom_path)) {
+    cat("Using built-in gene list (", nrow(built_in_genes), " genes).\n", sep = "")
+    return(built_in_genes)
+  }
+
+  if (!file.exists(custom_path)) {
+    warning("Custom gene list not found: ", custom_path, ". Falling back to built-in genes.")
+    return(built_in_genes)
+  }
+
+  cat("Loading custom gene list from: ", custom_path, "\n", sep = "")
+
+  custom_genes <- tryCatch(read.csv(custom_path, stringsAsFactors = FALSE),
+                           error = function(e) NULL)
+
+  if (is.null(custom_genes)) {
+    warning("Unable to read custom gene list; falling back to built-in genes.")
+    return(built_in_genes)
+  }
+
+  required_cols <- c("gene", "chr", "start")
+  missing_cols <- setdiff(required_cols, colnames(custom_genes))
+  if (length(missing_cols) > 0) {
+    warning("Missing required custom gene columns: ", paste(missing_cols, collapse = ", "),
+            ". Falling back to built-in genes.")
+    return(built_in_genes)
+  }
+
+  custom_genes <- custom_genes[, required_cols]
+  custom_genes$chr <- as.numeric(sub("^chr", "", as.character(custom_genes$chr), ignore.case = TRUE))
+  custom_genes$start <- as.numeric(custom_genes$start)
+  custom_genes <- custom_genes[!is.na(custom_genes$chr) & !is.na(custom_genes$start), ]
+  # Exclude chrX/chrY/chrM; this no-chrX workflow uses autosomes only (chr 1-22)
+  custom_genes <- custom_genes[custom_genes$chr >= 1 & custom_genes$chr <= 22, ]
+
+  if (nrow(custom_genes) == 0) {
+    warning("No valid custom genes after filtering chr/start; falling back to built-in genes.")
+    return(built_in_genes)
+  }
+
+  cat("Using custom gene list with ", nrow(custom_genes), " genes.\n", sep = "")
+  custom_genes
+}
+
+lookup_gene_ratios <- function(gene_list, B, C, THR) {
+  out <- data.frame(
+    gene = gene_list$gene,
+    chr = gene_list$chr,
+    start = gene_list$start,
+    ratio_point_initial = NA_real_,
+    CN_point_initial = NA_real_,
+    ratio_segment_initial = NA_real_,
+    CN_segment_initial = NA_real_,
+    ratio_segment_final = NA_real_,
+    CN_segment_final = NA_real_,
+    stringsAsFactors = FALSE
+  )
+
+  for (i in seq_len(nrow(gene_list))) {
+    chr_i <- gene_list$chr[i]
+    start_i <- gene_list$start[i]
+
+    B_chr <- B[B$chr == chr_i, ]
+    if (nrow(B_chr) > 0) {
+      idx_initial <- which.min(abs(B_chr$start - start_i))
+      initial_row <- B_chr[idx_initial, ]
+      out$ratio_point_initial[i] <- initial_row$ratio
+      out$CN_point_initial[i] <- round(initial_row$ratio / THR, 3)
+      out$ratio_segment_initial[i] <- initial_row$ratio_median
+      out$CN_segment_initial[i] <- round(initial_row$ratio_median / THR, 3)
+    }
+
+    C_chr <- C[C$chr == chr_i, ]
+    if (nrow(C_chr) > 0) {
+      idx_final <- which.min(abs(C_chr$start - start_i))
+      final_row <- C_chr[idx_final, ]
+      out$ratio_segment_final[i] <- final_row$ratio_median
+      out$CN_segment_final[i] <- round(final_row$ratio_median / THR, 3)
+    }
+  }
+
+  out
+}
 
 ##### LIBRARIES #####
 
@@ -3940,1436 +4071,20 @@ colnames(C) <- c("chr", "chr_arm", "start", "end", "ratio_median")
 C = C[which(C$chr != 23),]
 
 
-## zone 01: amplifications - chr1	DOCK7	JAK1	|| DOCK7	1	62920397-63154057 (hg19)	1489
-
-closest_initial_DOCK7 = Closest(B[which(B$chr == 1),]$start, 63037227)[1]
-
-higlight_initial_DOCK7 = B[B$chr == 1 & B$start == closest_initial_DOCK7,]
-
-CN_baseline_initial_segment_DOCK7 = round(higlight_initial_DOCK7$ratio_median/THR,3)
-
-CN_baseline_initial_point_DOCK7 = round(higlight_initial_DOCK7$ratio/THR,3)
-
-
-closest_final_DOCK7 = Closest(C[which(C$chr == 1),]$start, 63037227)[1]
-
-higlight_final_DOCK7 = C[C$chr == 1 & C$start == closest_final_DOCK7,]
-
-CN_baseline_final_DOCK7 = round(higlight_final_DOCK7$ratio_median/THR,3)
-
-
-
-
-## zone 02: amplifications - chr1	S100A1	ETV3L	 || HCN3	1	155247254-155259639 (hg19)	596
-
-closest_initial_HCN3 = Closest(B[which(B$chr == 1),]$start, 155253447)[1]
-
-higlight_initial_HCN3 = B[B$chr == 1 & B$start == closest_initial_HCN3,]
-
-CN_baseline_initial_segment_HCN3 = round(higlight_initial_HCN3$ratio_median/THR,3)
-
-CN_baseline_initial_point_HCN3 = round(higlight_initial_HCN3$ratio/THR,3)
-
-
-closest_final_HCN3 = Closest(C[which(C$chr == 1),]$start, 155253447)[1]
-
-higlight_final_HCN3 = C[C$chr == 1 & C$start == closest_final_HCN3,]
-
-CN_baseline_final_HCN3 = round(higlight_final_HCN3$ratio_median/THR,3)
-
-
-
-
-## zone 03: amplifications - chr1	JARID1B	MYBPH	 || KLHL12	1	202860248-202897727 (hg19)	363
-
-closest_initial_KLHL12 = Closest(B[which(B$chr == 1),]$start, 202878988)[1]
-
-higlight_initial_KLHL12 = B[B$chr == 1 & B$start == closest_initial_KLHL12,]
-
-CN_baseline_initial_segment_KLHL12 = round(higlight_initial_KLHL12$ratio_median/THR,3)
-
-CN_baseline_initial_point_KLHL12 = round(higlight_initial_KLHL12$ratio/THR,3)
-
-
-closest_final_KLHL12 = Closest(C[which(C$chr == 1),]$start, 202878988)[1]
-
-higlight_final_KLHL12 = C[C$chr == 1 & C$start == closest_final_KLHL12,]
-
-CN_baseline_final_KLHL12 = round(higlight_final_KLHL12$ratio_median/THR,3)
-
-
-
-
-## zone 04: amplifications - chr1	MDM4	RAB7L1	 || RBBP5	1	205055270-205091106 (hg19)	343  
-
-closest_initial_RBBP5 = Closest(B[which(B$chr == 1),]$start, 205073188)[1]
-
-higlight_initial_RBBP5 = B[B$chr == 1 & B$start == closest_initial_RBBP5,]
-
-CN_baseline_initial_segment_RBBP5 = round(higlight_initial_RBBP5$ratio_median/THR,3)
-
-CN_baseline_initial_point_RBBP5 = round(higlight_initial_RBBP5$ratio/THR,3)
-
-
-
-closest_final_RBBP5 = Closest(C[which(C$chr == 1),]$start, 205073188)[1]
-
-higlight_final_RBBP5 = C[C$chr == 1 & C$start == closest_final_RBBP5,]
-
-CN_baseline_final_RBBP5 = round(higlight_final_RBBP5$ratio_median/THR,3)
-
-
-
-
-## zone 05: amplifications - chr3	COMMD2	TSC22D2	 || TSC22D2	3	150126085-150184209 (hg19)	1148  
-
-closest_initial_TSC22D2 = Closest(B[which(B$chr == 3),]$start, 150155147)[1]
-
-higlight_initial_TSC22D2 = B[B$chr == 3 & B$start == closest_initial_TSC22D2,]
-
-CN_baseline_initial_segment_TSC22D2 = round(higlight_initial_TSC22D2$ratio_median/THR,3)
-
-CN_baseline_initial_point_TSC22D2 = round(higlight_initial_TSC22D2$ratio/THR,3)
-
-
-
-closest_final_TSC22D2 = Closest(C[which(C$chr == 3),]$start, 150155147)[1]
-
-higlight_final_TSC22D2 = C[C$chr == 3 & C$start == closest_final_TSC22D2,]
-
-CN_baseline_final_TSC22D2 = round(higlight_final_TSC22D2$ratio_median/THR,3)
-
-
-
-
-## zone 06: amplifications - chr3	AC092965.4-1	PYDC2	|| PIK3CA	3	178866145-178957881 (hg19)	1319
-
-closest_initial_PIK3CA = Closest(B[which(B$chr == 3),]$start, 178912013)[1]
-
-higlight_initial_PIK3CA = B[B$chr == 3 & B$start == closest_initial_PIK3CA,]
-
-CN_baseline_initial_segment_PIK3CA = round(higlight_initial_PIK3CA$ratio_median/THR,3)
-
-CN_baseline_initial_point_PIK3CA = round(higlight_initial_PIK3CA$ratio/THR,3)
-
-
-
-closest_final_PIK3CA = Closest(C[which(C$chr == 3),]$start, 178912013)[1]
-
-higlight_final_PIK3CA = C[C$chr == 3 & C$start == closest_final_PIK3CA,]
-
-CN_baseline_final_PIK3CA = round(higlight_final_PIK3CA$ratio_median/THR,3)
-
-
-
-
-
-## zone 07: amplifications - chr4	AMTN	SDAD1	 || ANKRD17	4	73939093-74124515 (hg19)	1008
-
-closest_initial_ANKRD17 = Closest(B[which(B$chr == 4),]$start, 74031804)[1]
-
-higlight_initial_ANKRD17 = B[B$chr == 4 & B$start == closest_initial_ANKRD17,]
-
-CN_baseline_initial_segment_ANKRD17 = round(higlight_initial_ANKRD17$ratio_median/THR,3)
-
-CN_baseline_initial_point_ANKRD17 = round(higlight_initial_ANKRD17$ratio/THR,3)
-
-
-
-closest_final_ANKRD17 = Closest(C[which(C$chr == 4),]$start, 74031804)[1]
-
-higlight_final_ANKRD17 = C[C$chr == 4 & C$start == closest_final_ANKRD17,]
-
-CN_baseline_final_ANKRD17 = round(higlight_final_ANKRD17$ratio_median/THR,3)
-
-
-
-
-
-## zone 08: homozygous deletions -  chr4	DCTD	RWDD4A	 ||  CDKN2AIP	4	184365789-184370217 (hg19)	61
-
-closest_initial_CDKN2AIP = Closest(B[which(B$chr == 4),]$start, 184368003)[1]
-
-higlight_initial_CDKN2AIP = B[B$chr == 4 & B$start == closest_initial_CDKN2AIP,]
-
-CN_baseline_initial_segment_CDKN2AIP = round(higlight_initial_CDKN2AIP$ratio_median/THR,3)
-
-CN_baseline_initial_point_CDKN2AIP = round(higlight_initial_CDKN2AIP$ratio/THR,3)
-
-
-
-closest_final_CDKN2AIP = Closest(C[which(C$chr == 4),]$start, 184368003)[1]
-
-higlight_final_CDKN2AIP = C[C$chr == 4 & C$start == closest_final_CDKN2AIP,]
-
-CN_baseline_final_CDKN2AIP = round(higlight_final_CDKN2AIP$ratio_median/THR,3)
-
-
-
-
-
-## zone 09: amplifications -  chr6	POPDC3	FOXO3	 ||  RTN4IP1	6	107018646-107078366  (hg19)	332
-
-closest_initial_RTN4IP1 = Closest(B[which(B$chr == 6),]$start, 107048506)[1]
-
-higlight_initial_RTN4IP1 = B[B$chr == 6 & B$start == closest_initial_RTN4IP1,]
-
-CN_baseline_initial_segment_RTN4IP1 = round(higlight_initial_RTN4IP1$ratio_median/THR,3)
-
-CN_baseline_initial_point_RTN4IP1 = round(higlight_initial_RTN4IP1$ratio/THR,3)
-
-
-
-closest_final_RTN4IP1 = Closest(C[which(C$chr == 6),]$start, 107048506)[1]
-
-higlight_final_RTN4IP1 = C[C$chr == 6 & C$start == closest_final_RTN4IP1,]
-
-CN_baseline_final_RTN4IP1 = round(higlight_final_RTN4IP1$ratio_median/THR,3)
-
-
-
-
-## zone 09 bis: amplifications - chr6	POPDC3	FOXO3	 ||  AIM1 Chromosome 6: 106808592-107019892 (hg19) forward strand.
-
-closest_initial_AIM1 = Closest(B[which(B$chr == 6),]$start, 106914242)[1]
-
-higlight_initial_AIM1 = B[B$chr == 6 & B$start == closest_initial_AIM1,]
-
-CN_baseline_initial_segment_AIM1 = round(higlight_initial_AIM1$ratio_median/THR,3)
-
-CN_baseline_initial_point_AIM1 = round(higlight_initial_AIM1$ratio/THR,3)
-
-
-
-closest_final_AIM1 = Closest(C[which(C$chr == 6),]$start, 106914242)[1]
-
-higlight_final_AIM1 = C[C$chr == 6 & C$start == closest_final_AIM1,]
-
-CN_baseline_final_AIM1 = round(higlight_final_AIM1$ratio_median/THR,3)
-
-
-
-
-
-## zone 11: homozygous deletions -  chr8	INTS10	PPP3CC	|| INTS10	8	19674927-19709578 (hg19)	2
-
-closest_initial_INTS10 = Closest(B[which(B$chr == 8),]$start, 19692253)[1]
-
-higlight_initial_INTS10 = B[B$chr == 8 & B$start == closest_initial_INTS10,]
-
-CN_baseline_initial_segment_INTS10 = round(higlight_initial_INTS10$ratio_median/THR,3)
-
-CN_baseline_initial_point_INTS10 = round(higlight_initial_INTS10$ratio/THR,3)
-
-
-
-closest_final_INTS10 = Closest(C[which(C$chr == 8),]$start, 19692253)[1]
-
-higlight_final_INTS10 = C[C$chr == 8 & C$start == closest_final_INTS10,]
-
-CN_baseline_final_INTS10 = round(higlight_final_INTS10$ratio_median/THR,3)
-
-
-
-
-## zone 12: homozygous deletions - chr8	PPP2R2A	INTS9	 ||  PPP2R2A Chromosome 8: 26149024-26230196 (hg19) forward strand.
-
-closest_initial_PPP2R2A = Closest(B[which(B$chr == 8),]$start, 26189610)[1]
-
-higlight_initial_PPP2R2A = B[B$chr == 8 & B$start == closest_initial_PPP2R2A,]
-
-CN_baseline_initial_segment_PPP2R2A = round(higlight_initial_PPP2R2A$ratio_median/THR,3)
-
-CN_baseline_initial_point_PPP2R2A = round(higlight_initial_PPP2R2A$ratio/THR,3)
-
-
-
-closest_final_PPP2R2A = Closest(C[which(C$chr == 8),]$start, 26189610)[1]
-
-higlight_final_PPP2R2A = C[C$chr == 8 & C$start == closest_final_PPP2R2A,]
-
-CN_baseline_final_PPP2R2A = round(higlight_final_PPP2R2A$ratio_median/THR,3)
-
-
-
-
-## zone 13: amplifications - chr8	ZNF703	ADAM32	 ||  BRF2	8	37700786-37707379 (hg19) 15
-
-closest_initial_BRF2 = Closest(B[which(B$chr == 8),]$start, 37704083)[1]
-
-higlight_initial_BRF2 = B[B$chr == 8 & B$start == closest_initial_BRF2,]
-
-CN_baseline_initial_segment_BRF2 = round(higlight_initial_BRF2$ratio_median/THR,3)
-
-CN_baseline_initial_point_BRF2 = round(higlight_initial_BRF2$ratio/THR,3)
-
-
-
-closest_final_BRF2 = Closest(C[which(C$chr == 8),]$start, 37704083)[1]
-
-higlight_final_BRF2 = C[C$chr == 8 & C$start == closest_final_BRF2,]
-
-CN_baseline_final_BRF2 = round(higlight_final_BRF2$ratio_median/THR,3)
-
-
-
-
-
-## zone 13 bis: amplifications - chr8	ZNF703	ADAM32	  ||  ZNF703 Chromosome 8: 37553300-37557537 (hg19) forward strand.
-
-closest_initial_ZNF703 = Closest(B[which(B$chr == 8),]$start, 37555419)[1]
-
-higlight_initial_ZNF703 = B[B$chr == 8 & B$start == closest_initial_ZNF703,]
-
-CN_baseline_initial_segment_ZNF703 = round(higlight_initial_ZNF703$ratio_median/THR,3)
-
-CN_baseline_initial_point_ZNF703 = round(higlight_initial_ZNF703$ratio/THR,3)
-
-
-
-closest_final_ZNF703 = Closest(C[which(C$chr == 8),]$start, 37555419)[1]
-
-higlight_final_ZNF703 = C[C$chr == 8 & C$start == closest_final_ZNF703,]
-
-CN_baseline_final_ZNF703 = round(higlight_final_ZNF703$ratio_median/THR,3)
-
-
-
-
-## zone 14 bis: amplifications - chr8	FAM84B	ZFAT	 ||  MYC Chromosome 8: 128747680-128755197  (hg19) forward strand.
-
-closest_initial_MYC = Closest(B[which(B$chr == 8),]$start, 128751439)[1]
-
-higlight_initial_MYC = B[B$chr == 8 & B$start == closest_initial_MYC,]
-
-CN_baseline_initial_segment_MYC = round(higlight_initial_MYC$ratio_median/THR,3)
-
-CN_baseline_initial_point_MYC = round(higlight_initial_MYC$ratio/THR,3)
-
-
-
-closest_final_MYC = Closest(C[which(C$chr == 8),]$start, 128751439)[1]
-
-higlight_final_MYC = C[C$chr == 8 & C$start == closest_final_MYC,]
-
-CN_baseline_final_MYC = round(higlight_final_MYC$ratio_median/THR,3)
-
-
-
-
-# Zone +1: CD274  Chromosome 9: 5450542-5470554 (hg19) forward strand. PDL1
-
-closest_initial_CD274_PDL1 = Closest(B[which(B$chr == 9),]$start, 5460548)[1]
-
-higlight_initial_CD274_PDL1 = B[B$chr == 9 & B$start == closest_initial_CD274_PDL1,]
-
-CN_baseline_initial_segment_CD274_PDL1 = round(higlight_initial_CD274_PDL1$ratio_median/THR,3)
-
-CN_baseline_initial_point_CD274_PDL1 = round(higlight_initial_CD274_PDL1$ratio/THR,3)
-
-
-
-closest_final_CD274_PDL1 = Closest(C[which(C$chr == 9),]$start, 5460548)[1]
-
-higlight_final_CD274_PDL1 = C[C$chr == 9 & C$start == closest_final_CD274_PDL1,]
-
-CN_baseline_final_CD274_PDL1 = round(higlight_final_CD274_PDL1$ratio_median/THR,3)
-
-
-
-
-## zone 15: homozygous deletions - chr9	MTAP	CDKN2B	 || MTAP	9	21802635-21867080 (hg19)	2727
-
-closest_initial_MTAP = Closest(B[which(B$chr == 9),]$start, 21834858)[1]
-
-higlight_initial_MTAP = B[B$chr == 9 & B$start == closest_initial_MTAP,]
-
-CN_baseline_initial_segment_MTAP = round(higlight_initial_MTAP$ratio_median/THR,3)
-
-CN_baseline_initial_point_MTAP = round(higlight_initial_MTAP$ratio/THR,3)
-
-
-
-closest_final_MTAP = Closest(C[which(C$chr == 9),]$start, 21834858)[1]
-
-higlight_final_MTAP = C[C$chr == 9 & C$start == closest_final_MTAP,]
-
-CN_baseline_final_MTAP = round(higlight_final_MTAP$ratio_median/THR,3)
-
-
-
-
-
-
-
-## zone 16: amplifications - chr10	RP11-730A19.6	FAM107B	 ||  SEPHS1	10	13359428-13390293	552
-
-closest_initial_SEPHS1 = Closest(B[which(B$chr == 10),]$start, 13374861)[1]
-
-higlight_initial_SEPHS1 = B[B$chr == 10 & B$start == closest_initial_SEPHS1,]
-
-CN_baseline_initial_segment_SEPHS1 = round(higlight_initial_SEPHS1$ratio_median/THR,3)
-
-CN_baseline_initial_point_SEPHS1 = round(higlight_initial_SEPHS1$ratio/THR,3)
-
-
-
-closest_final_SEPHS1 = Closest(C[which(C$chr == 10),]$start, 13374861)[1]
-
-higlight_final_SEPHS1 = C[C$chr == 10 & C$start == closest_final_SEPHS1,]
-
-CN_baseline_final_SEPHS1 = round(higlight_final_SEPHS1$ratio_median/THR,3)
-
-
-
-
-
-## zone 17: amplifications - chr10	COMTD1	RP11-369J21.6	 || ZMIZ1	10	80828723-81076276 (hg19)	454
-
-closest_initial_ZMIZ1 = Closest(B[which(B$chr == 10),]$start, 80828723)[1]
-
-higlight_initial_ZMIZ1 = B[B$chr == 10 & B$start == closest_initial_ZMIZ1,]
-
-CN_baseline_initial_segment_ZMIZ1 = round(higlight_initial_ZMIZ1$ratio_median/THR,3)
-
-CN_baseline_initial_point_ZMIZ1 = round(higlight_initial_ZMIZ1$ratio/THR,3)
-
-
-
-closest_final_ZMIZ1 = Closest(C[which(C$chr == 10),]$start, 80828723)[1]
-
-higlight_final_ZMIZ1 = C[C$chr == 10 & C$start == closest_final_ZMIZ1,]
-
-CN_baseline_final_ZMIZ1 = round(higlight_final_ZMIZ1$ratio_median/THR,3)
-
-
-
-
-
-## zone 18: homozygous deletions - chr10	WAPAL	IFIT5	 ||  WAPAL	10	88195013-88281549 (hg19)	4749
-
-closest_initial_WAPAL = Closest(B[which(B$chr == 10),]$start, 88238281)[1]
-
-higlight_initial_WAPAL = B[B$chr == 10 & B$start == closest_initial_WAPAL,]
-
-CN_baseline_initial_segment_WAPAL = round(higlight_initial_WAPAL$ratio_median/THR,3)
-
-CN_baseline_initial_point_WAPAL = round(higlight_initial_WAPAL$ratio/THR,3)
-
-
-
-closest_final_WAPAL = Closest(C[which(C$chr == 10),]$start, 88238281)[1]
-
-higlight_final_WAPAL = C[C$chr == 10 & C$start == closest_final_WAPAL,]
-
-CN_baseline_final_WAPAL = round(higlight_final_WAPAL$ratio_median/THR,3)
-
-
-
-
-
-## zone 18: homozygous deletions - chr10	WAPAL	IFIT5	 ||  PTEN Chromosome 10: 89623382-89731687 (hg19)  forward strand.
-
-closest_initial_PTEN = Closest(B[which(B$chr == 10),]$start, 89677535)[1]
-
-higlight_initial_PTEN = B[B$chr == 10 & B$start == closest_initial_PTEN,]
-
-CN_baseline_initial_segment_PTEN = round(higlight_initial_PTEN$ratio_median/THR,3)
-
-CN_baseline_initial_point_PTEN = round(higlight_initial_PTEN$ratio/THR,3)
-
-
-closest_final_PTEN = Closest(C[which(C$chr == 10),]$start, 89677535)[1]
-
-higlight_final_PTEN = C[C$chr == 10 & C$start == closest_final_PTEN,]
-
-CN_baseline_final_PTEN = round(higlight_final_PTEN$ratio_median/THR,3)
-
-
-
-
-
-## zone 19: amplifications - chr11	DNAJC24	C11orf55	 || CSTF3	11	33106130-33183026 (hg19)	583
-
-closest_initial_CSTF3 = Closest(B[which(B$chr == 11),]$start, 33144578)[1]
-
-higlight_initial_CSTF3 = B[B$chr == 11 & B$start == closest_initial_CSTF3,]
-
-CN_baseline_initial_segment_CSTF3 = round(higlight_initial_CSTF3$ratio_median/THR,3)
-
-CN_baseline_initial_point_CSTF3 = round(higlight_initial_CSTF3$ratio/THR,3)
-
-
-
-closest_final_CSTF3 = Closest(C[which(C$chr == 11),]$start, 33144578)[1]
-
-higlight_final_CSTF3 = C[C$chr == 11 & C$start == closest_final_CSTF3,]
-
-CN_baseline_final_CSTF3 = round(higlight_final_CSTF3$ratio_median/THR,3)
-
-
-
-
-## zone 20: amplifications - chr11	RBM4	LRFN4	 || BBS1	11	66278106-66301069 (hg19)	352
-
-closest_initial_BBS1 = Closest(B[which(B$chr == 11),]$start, 66289588)[1]
-
-higlight_initial_BBS1 = B[B$chr == 11 & B$start == closest_initial_BBS1,]
-
-CN_baseline_initial_segment_BBS1 = round(higlight_initial_BBS1$ratio_median/THR,3)
-
-CN_baseline_initial_point_BBS1 = round(higlight_initial_BBS1$ratio/THR,3)
-
-
-
-closest_final_BBS1 = Closest(C[which(C$chr == 11),]$start, 66289588)[1]
-
-higlight_final_BBS1 = C[C$chr == 11 & C$start == closest_final_BBS1,]
-
-CN_baseline_final_BBS1 = round(higlight_final_BBS1$ratio_median/THR,3)
-
-
-
-
-
-
-## zone 21: amplifications - chr11	MTL5	CTTN	 ||   CTTN	11	70244635 70282681 (hg19)	7
-## FADD	11	6 (0RAOV1/CTTN)
-## CTTN	11		7
-## ORAOV1	11		12
-
-closest_initial_CTTN = Closest(B[which(B$chr == 11),]$start, 70263658)[1]
-
-higlight_initial_CTTN = B[B$chr == 11 & B$start == closest_initial_CTTN,]
-
-CN_baseline_initial_segment_CTTN = round(higlight_initial_CTTN$ratio_median/THR,3)
-
-CN_baseline_initial_point_CTTN = round(higlight_initial_CTTN$ratio/THR,3)
-
-
-closest_final_CTTN = Closest(C[which(C$chr == 11),]$start, 70263658)[1]
-
-higlight_final_CTTN = C[C$chr == 11 & C$start == closest_final_CTTN,]
-
-CN_baseline_final_CTTN = round(higlight_final_CTTN$ratio_median/THR,3)
-
-
-
-
-## zone 21 bis: amplifications - chr11	MTL5	CTTN	 ||  CCND1	11	69455924-69469242 (hg19)	64
-
-## CCND1	11		64
-
-closest_initial_CCND1 = Closest(B[which(B$chr == 11),]$start, 69462583)[1]
-
-higlight_initial_CCND1 = B[B$chr == 11 & B$start == closest_initial_CCND1,]
-
-CN_baseline_initial_segment_CCND1 = round(higlight_initial_CCND1$ratio_median/THR,3)
-
-CN_baseline_initial_point_CCND1 = round(higlight_initial_CCND1$ratio/THR,3)
-
-
-
-closest_final_CCND1 = Closest(C[which(C$chr == 11),]$start, 69462583)[1]
-
-higlight_final_CCND1 = C[C$chr == 11 & C$start == closest_final_CCND1,]
-
-CN_baseline_final_CCND1 = round(higlight_final_CCND1$ratio_median/THR,3)
-
-
-
-
-
-
-## zone 22: amplifications -  chr11	FOLR2	P2RY6	|| ATG16L2	11	72525456-72540680 (hg19)	420
-
-closest_initial_ATG16L2 = Closest(B[which(B$chr == 11),]$start, 72533068)[1]
-
-higlight_initial_ATG16L2 = B[B$chr == 11 & B$start == closest_initial_ATG16L2,]
-
-CN_baseline_initial_segment_ATG16L2 = round(higlight_initial_ATG16L2$ratio_median/THR,3)
-
-CN_baseline_initial_point_ATG16L2 = round(higlight_initial_ATG16L2$ratio/THR,3)
-
-
-
-closest_final_ATG16L2 = Closest(C[which(C$chr == 11),]$start, 72533068)[1]
-
-higlight_final_ATG16L2 = C[C$chr == 11 & C$start == closest_final_ATG16L2,]
-
-CN_baseline_final_ATG16L2 = round(higlight_final_ATG16L2$ratio_median/THR,3)
-
-
-
-
-## zone 23: amplifications - chr11	UVRAG	GAB2	||   INTS4	11 77589766-77705714 (hg19)	20
-
-# PAK1	11		41
-# RSF1	11		39
-# INTS4	11		20
-
-closest_initial_INTS4 = Closest(B[which(B$chr == 11),]$start, 77647740)[1]
-
-higlight_initial_INTS4 = B[B$chr == 11 & B$start == closest_initial_INTS4,]
-
-CN_baseline_initial_segment_INTS4 = round(higlight_initial_INTS4$ratio_median/THR,3)
-
-CN_baseline_initial_point_INTS4 = round(higlight_initial_INTS4$ratio/THR,3)
-
-
-
-closest_final_INTS4 = Closest(C[which(C$chr == 11),]$start, 77647740)[1]
-
-higlight_final_INTS4 = C[C$chr == 11 & C$start == closest_final_INTS4,]
-
-CN_baseline_final_INTS4 = round(higlight_final_INTS4$ratio_median/THR,3)
-
-
-
-
-
-## zone 24: amplifications - chr12	JARID1A	RAD51AP1	 || CCDC77	12 498513-551808	(hg19) 655
-
-closest_initial_CCDC77 = Closest(B[which(B$chr == 12),]$start, 525161)[1]
-
-higlight_initial_CCDC77 = B[B$chr == 12 & B$start == closest_initial_CCDC77,]
-
-CN_baseline_initial_segment_CCDC77 = round(higlight_initial_CCDC77$ratio_median/THR,3)
-
-CN_baseline_initial_point_CCDC77 = round(higlight_initial_CCDC77$ratio/THR,3)
-
-
-
-closest_final_CCDC77 = Closest(C[which(C$chr == 12),]$start, 525161)[1]
-
-higlight_final_CCDC77 = C[C$chr == 12 & C$start == closest_final_CCDC77,]
-
-CN_baseline_final_CCDC77 = round(higlight_final_CCDC77$ratio_median/THR,3)
-
-
-
-
-
-
-## zone 24 bis: amplifications - chr12	JARID1A	RAD51AP1	 || FOXM1 Chromosome 12: 2966846-2986340 (hg19) reverse strand.
-
-closest_initial_FOXM1 = Closest(B[which(B$chr == 12),]$start, 2976593)[1]
-
-higlight_initial_FOXM1 = B[B$chr == 12 & B$start == closest_initial_FOXM1,]
-
-CN_baseline_initial_segment_FOXM1 = round(higlight_initial_FOXM1$ratio_median/THR,3)
-
-CN_baseline_initial_point_FOXM1 = round(higlight_initial_FOXM1$ratio/THR,3)
-
-
-
-closest_final_FOXM1 = Closest(C[which(C$chr == 12),]$start, 2976593)[1]
-
-higlight_final_FOXM1 = C[C$chr == 12 & C$start == closest_final_FOXM1,]
-
-CN_baseline_final_FOXM1 = round(higlight_final_FOXM1$ratio_median/THR,3)
-
-
-
-
-
-## zone 25: amplifications - chr12	MDM1	CNOT2	 ||  YEATS4	12 69753523-69784650 (hg19)	305
-
-closest_initial_YEATS4 = Closest(B[which(B$chr == 12),]$start, 69769087)[1]
-
-higlight_initial_YEATS4 = B[B$chr == 12 & B$start == closest_initial_YEATS4,]
-
-CN_baseline_initial_segment_YEATS4 = round(higlight_initial_YEATS4$ratio_median/THR,3)
-
-CN_baseline_initial_point_YEATS4 = round(higlight_initial_YEATS4$ratio/THR,3)
-
-
-
-closest_final_YEATS4 = Closest(C[which(C$chr == 12),]$start, 69769087)[1]
-
-higlight_final_YEATS4 = C[C$chr == 12 & C$start == closest_final_YEATS4,]
-
-CN_baseline_final_YEATS4 = round(higlight_final_YEATS4$ratio_median/THR,3)
-
-
-
-
-
-
-## zone 25 bis: amplifications - chr12	MDM1	CNOT2	 ||  MDM2 Chromosome 12: 69201952-69244466 (hg19) forward strand.
-
-closest_initial_MDM2 = Closest(B[which(B$chr == 12),]$start, 69223209)[1]
-
-higlight_initial_MDM2 = B[B$chr == 12 & B$start == closest_initial_MDM2,]
-
-CN_baseline_initial_segment_MDM2 = round(higlight_initial_MDM2$ratio_median/THR,3)
-
-CN_baseline_initial_point_MDM2 = round(higlight_initial_MDM2$ratio/THR,3)
-
-
-
-closest_final_MDM2 = Closest(C[which(C$chr == 12),]$start, 69223209)[1]
-
-higlight_final_MDM2 = C[C$chr == 12 & C$start == closest_final_MDM2,]
-
-CN_baseline_final_MDM2 = round(higlight_final_MDM2$ratio_median/THR,3)
-
-
-
-
-
-# Zone +2: BRCA2  Chromosome 13: 32889645-32974405 (hg19) forward strand.
-
-closest_initial_BRCA2 = Closest(B[which(B$chr == 13),]$start, 32932025)[1]
-
-higlight_initial_BRCA2 = B[B$chr == 13 & B$start == closest_initial_BRCA2,]
-
-CN_baseline_initial_segment_BRCA2 = round(higlight_initial_BRCA2$ratio_median/THR,3)
-
-CN_baseline_initial_point_BRCA2 = round(higlight_initial_BRCA2$ratio/THR,3)
-
-
-closest_final_BRCA2 = Closest(C[which(C$chr == 13),]$start, 32932025)[1]
-
-higlight_final_BRCA2 = C[C$chr == 13 & C$start == closest_final_BRCA2,]
-
-CN_baseline_final_BRCA2 = round(higlight_final_BRCA2$ratio_median/THR,3)
-
-
-
-
-
-## zone 26: amplifications - chr13	13	UFM1	COG6	 || C13orf23	13	39584002-39612226 (hg19)	2343
-
-closest_initial_C13orf23 = Closest(B[which(B$chr == 13),]$start, 39598114)[1]
-
-higlight_initial_C13orf23 = B[B$chr == 13 & B$start == closest_initial_C13orf23,]
-
-CN_baseline_initial_segment_C13orf23 = round(higlight_initial_C13orf23$ratio_median/THR,3)
-
-CN_baseline_initial_point_C13orf23 = round(higlight_initial_C13orf23$ratio/THR,3)
-
-
-
-closest_final_C13orf23 = Closest(C[which(C$chr == 13),]$start, 39598114)[1]
-
-higlight_final_C13orf23 = C[C$chr == 13 & C$start == closest_final_C13orf23,]
-
-CN_baseline_final_C13orf23 = round(higlight_final_C13orf23$ratio_median/THR,3)
-
-
-
-
-
-## zone 27 & 28: homozygous deletions chr13	13	SIAH3	RNASEH2B	  || TRIM13	13 50571178-50592603 (hg19)		53
-
-closest_initial_TRIM13 = Closest(B[which(B$chr == 13),]$start, 50581891)[1]
-
-higlight_initial_TRIM13 = B[B$chr == 13 & B$start == closest_initial_TRIM13,]
-
-CN_baseline_initial_segment_TRIM13 = round(higlight_initial_TRIM13$ratio_median/THR,3)
-
-CN_baseline_initial_point_TRIM13 = round(higlight_initial_TRIM13$ratio/THR,3)
-
-
-
-closest_final_TRIM13 = Closest(C[which(C$chr == 13),]$start, 50581891)[1]
-
-higlight_final_TRIM13 = C[C$chr == 13 & C$start == closest_final_TRIM13,]
-
-CN_baseline_final_TRIM13 = round(higlight_final_TRIM13$ratio_median/THR,3)
-
-
-
-
-## zone 29 :  SDCCAG1	14 50248801-50319506	(hg19)	488
-
-closest_initial_SDCCAG1 = Closest(B[which(B$chr == 14),]$start, 50284154)[1]
-
-higlight_initial_SDCCAG1 = B[B$chr == 14 & B$start == closest_initial_SDCCAG1,]
-
-CN_baseline_initial_segment_SDCCAG1 = round(higlight_initial_SDCCAG1$ratio_median/THR,3)
-
-CN_baseline_initial_point_SDCCAG1 = round(higlight_initial_SDCCAG1$ratio/THR,3)
-
-
-closest_final_SDCCAG1 = Closest(C[which(C$chr == 14),]$start, 50284154)[1]
-
-higlight_final_SDCCAG1 = C[C$chr == 14 & C$start == closest_final_SDCCAG1,]
-
-CN_baseline_final_SDCCAG1 = round(higlight_final_SDCCAG1$ratio_median/THR,3)
-
-
-
-
-
-## zone 30:   Homozygous deletion  chr15	PLA2G4E	TTBK2	 || SNAP23	15	42787832-42825256	33
-
-closest_initial_SNAP23 = Closest(B[which(B$chr == 15),]$start,42806544)[1]
-
-higlight_initial_SNAP23 = B[B$chr == 15 & B$start == closest_initial_SNAP23,]
-
-CN_baseline_initial_segment_SNAP23 = round(higlight_initial_SNAP23$ratio_median/THR,3)
-
-CN_baseline_initial_point_SNAP23 = round(higlight_initial_SNAP23$ratio/THR,3)
-
-
-
-closest_final_SNAP23 = Closest(C[which(C$chr == 15),]$start, 42806544)[1]
-
-higlight_final_SNAP23 = C[C$chr == 15 & C$start == closest_final_SNAP23,]
-
-CN_baseline_final_SNAP23 = round(higlight_final_SNAP23$ratio_median/THR,3)
-
-
-
-
-## zone 31: amplifications -  chr15	ARRDC4	TTC23	||  IGF1R	15	99191768-99507759 (hg19)	530
-
-closest_initial_IGF1R = Closest(B[which(B$chr == 15),]$start, 99349764)[1]
-
-higlight_initial_IGF1R = B[B$chr == 15 & B$start == closest_initial_IGF1R,]
-
-CN_baseline_initial_segment_IGF1R = round(higlight_initial_IGF1R$ratio_median/THR,3)
-
-CN_baseline_initial_point_IGF1R = round(higlight_initial_IGF1R$ratio/THR,3)
-
-
-
-closest_final_IGF1R = Closest(C[which(C$chr == 15),]$start, 99349764)[1]
-
-higlight_final_IGF1R = C[C$chr == 15 & C$start == closest_final_IGF1R,]
-
-CN_baseline_final_IGF1R = round(higlight_final_IGF1R$ratio_median/THR,3)
-
-
-
-
-## zone 32: homozygous deletions - chr16	TMCO7	PDXDC2	 || CYB5B	16 69458522-69500167	(hg19)	41
-
-closest_initial_CYB5B = Closest(B[which(B$chr == 16),]$start, 69479345)[1]
-
-higlight_initial_CYB5B = B[B$chr == 16 & B$start == closest_initial_CYB5B,]
-
-CN_baseline_initial_segment_CYB5B = round(higlight_initial_CYB5B$ratio_median/THR,3)
-
-CN_baseline_initial_point_CYB5B = round(higlight_initial_CYB5B$ratio/THR,3)
-
-
-
-closest_final_CYB5B = Closest(C[which(C$chr == 16),]$start, 69479345)[1]
-
-higlight_final_CYB5B = C[C$chr == 16 & C$start == closest_final_CYB5B,]
-
-CN_baseline_final_CYB5B = round(higlight_final_CYB5B$ratio_median/THR,3)
-
-
-
-
-
-# Zone +3: P53 Chromosome 17: 7571739-7590808 (hg19)  reverse strand.
-
-closest_initial_P53 = Closest(B[which(B$chr == 17),]$start, 7581274)[1]
-
-higlight_initial_P53 = B[B$chr == 17 & B$start == closest_initial_P53,]
-
-CN_baseline_initial_segment_P53 = round(higlight_initial_P53$ratio_median/THR,3)
-
-CN_baseline_initial_point_P53 = round(higlight_initial_P53$ratio/THR,3)
-
-
-
-closest_final_P53 = Closest(C[which(C$chr == 17),]$start, 7581274)[1]
-
-higlight_final_P53 = C[C$chr == 17 & C$start == closest_final_P53,]
-
-CN_baseline_final_P53 = round(higlight_final_P53$ratio_median/THR,3)
-
-
-
-
-
-## zone 33: homozygous deletions - chr17	DNAH9	ELAC2	 ||  ELAC2	17 12894929-12921344 (hg19)		6025
-
-closest_initial_ELAC2 = Closest(B[which(B$chr == 17),]$start, 12908137)[1]
-
-higlight_initial_ELAC2 = B[B$chr == 17 & B$start == closest_initial_ELAC2,]
-
-CN_baseline_initial_segment_ELAC2 = round(higlight_initial_ELAC2$ratio_median/THR,3)
-
-CN_baseline_initial_point_ELAC2 = round(higlight_initial_ELAC2$ratio/THR,3)
-
-
-
-closest_final_ELAC2 = Closest(C[which(C$chr == 17),]$start, 12908137)[1]
-
-higlight_final_ELAC2 = C[C$chr == 17 & C$start == closest_final_ELAC2,]
-
-CN_baseline_final_ELAC2 = round(higlight_final_ELAC2$ratio_median/THR,3)
-
-
-
-
-## zone 33 bis: homozygous deletions - chr17	DNAH9	ELAC2	||  MAP2K4 Chromosome 17: 11924194-12047145 (hg19) forward strand.
-
-closest_initial_MAP2K4 = Closest(B[which(B$chr == 17),]$start, 11985670)[1]
-
-higlight_initial_MAP2K4 = B[B$chr == 17 & B$start == closest_initial_MAP2K4,]
-
-CN_baseline_initial_segment_MAP2K4 = round(higlight_initial_MAP2K4$ratio_median/THR,3)
-
-CN_baseline_initial_point_MAP2K4 = round(higlight_initial_MAP2K4$ratio/THR,3)
-
-
-closest_final_MAP2K4 = Closest(C[which(C$chr == 17),]$start, 11985670)[1]
-
-higlight_final_MAP2K4 = C[C$chr == 17 & C$start == closest_final_MAP2K4,]
-
-CN_baseline_final_MAP2K4 = round(higlight_final_MAP2K4$ratio_median/THR,3)
-
-
-
-
-
-
-## zone 34: amplifications - chr17	USP22	GOSR1	 || ERAL1	17	27182034-27188079	188 (hg19)
-
-closest_initial_ERAL1 = Closest(B[which(B$chr == 17),]$start, 27185057)[1]
-
-higlight_initial_ERAL1 = B[B$chr == 17 & B$start == closest_initial_ERAL1,]
-
-CN_baseline_initial_segment_ERAL1 = round(higlight_initial_ERAL1$ratio_median/THR,3)
-
-CN_baseline_initial_point_ERAL1 = round(higlight_initial_ERAL1$ratio/THR,3)
-
-
-closest_final_ERAL1 = Closest(C[which(C$chr == 17),]$start, 27185057)[1]
-
-higlight_final_ERAL1 = C[C$chr == 17 & C$start == closest_final_ERAL1,]
-
-CN_baseline_final_ERAL1 = round(higlight_final_ERAL1$ratio_median/THR,3)
-
-
-
-
-
-# Zone +4: NF1 Chromosome 17: 29421945-29704695 (hg19)  forward strand.
-
-closest_initial_NF1 = Closest(B[which(B$chr == 17),]$start, 29563320)[1]
-
-higlight_initial_NF1 = B[B$chr == 17 & B$start == closest_initial_NF1,]
-
-CN_baseline_initial_segment_NF1 = round(higlight_initial_NF1$ratio_median/THR,3)
-
-CN_baseline_initial_point_NF1 = round(higlight_initial_NF1$ratio/THR,3)
-
-
-closest_final_NF1 = Closest(C[which(C$chr == 17),]$start, 29563320)[1]
-
-higlight_final_NF1 = C[C$chr == 17 & C$start == closest_final_NF1,]
-
-CN_baseline_final_NF1 = round(higlight_final_NF1$ratio_median/THR,3)
-
-
-
-
-
-## zone 35: amplifications - chr17	NEUROD2	IKZF3	35015230	35273967 ||   ERBB2 (HER2+)	17 37844347-37884911 (hg19)		5 (PERLD1/C17orf37/GRB7/STARD3)
-# PERLD1	17	3	2
-# ERBB2	17		5
-# C17orf37	17		3
-# GRB7	17		1
-# STARD3	17		4
-
-
-closest_initial_ERBB2 = Closest(B[which(B$chr == 17),]$start, 37864629)[1]
-
-higlight_initial_ERBB2 = B[B$chr == 17 & B$start == closest_initial_ERBB2,]
-
-CN_baseline_initial_segment_ERBB2 = round(higlight_initial_ERBB2$ratio_median/THR,3)
-
-CN_baseline_initial_point_ERBB2 = round(higlight_initial_ERBB2$ratio/THR,3)
-
-
-closest_final_ERBB2 = Closest(C[which(C$chr == 17),]$start, 37864629)[1]
-
-higlight_final_ERBB2 = C[C$chr == 17 & C$start == closest_final_ERBB2,]
-
-CN_baseline_final_ERBB2 = round(higlight_final_ERBB2$ratio_median/THR,3)
-
-
-
-# Zone +5: BRCA1  Chromosome 17: 41196312-41277381 (hg19) reverse strand.
-
-closest_initial_BRCA1 = Closest(B[which(B$chr == 17),]$start, 41236847)[1]
-
-higlight_initial_BRCA1 = B[B$chr == 17 & B$start == closest_initial_BRCA1,]
-
-CN_baseline_initial_segment_BRCA1 = round(higlight_initial_BRCA1$ratio_median/THR,3)
-
-CN_baseline_initial_point_BRCA1 = round(higlight_initial_BRCA1$ratio/THR,3)
-
-
-closest_final_BRCA1 = Closest(C[which(C$chr == 17),]$start, 41236847)[1]
-
-higlight_final_BRCA1 = C[C$chr == 17 & C$start == closest_final_BRCA1,]
-
-CN_baseline_final_BRCA1 = round(higlight_final_BRCA1$ratio_median/THR,3)
-
-
-
-
-
-## zone 36: amplifications chr17	HOXB13	NME1  -  NME2	 || PHB	17 47481414-47492244 (hg19)	55
-
-closest_initial_PHB = Closest(B[which(B$chr == 17),]$start, 47486829)[1]
-
-higlight_initial_PHB = B[B$chr == 17 & B$start == closest_initial_PHB,]
-
-CN_baseline_initial_segment_PHB = round(higlight_initial_PHB$ratio_median/THR,3)
-
-CN_baseline_initial_point_PHB = round(higlight_initial_PHB$ratio/THR,3)
-
-
-closest_final_PHB = Closest(C[which(C$chr == 17),]$start, 47486829)[1]
-
-higlight_final_PHB = C[C$chr == 17 & C$start == closest_final_PHB,]
-
-CN_baseline_final_PHB = round(higlight_final_PHB$ratio_median/THR,3)
-
-
-
-
-## zone 37: amplifications - chr17	SUPT4H1	RNF43	 || SUPT4H1	17	56422539-56430454	(hg19) 74
-
-closest_initial_SUPT4H1 = Closest(B[which(B$chr == 17),]$start, 56426497)[1]
-
-higlight_initial_SUPT4H1 = B[B$chr == 17 & B$start == closest_initial_SUPT4H1,]
-
-CN_baseline_initial_segment_SUPT4H1 = round(higlight_initial_SUPT4H1$ratio_median/THR,3)
-
-CN_baseline_initial_point_SUPT4H1 = round(higlight_initial_SUPT4H1$ratio/THR,3)
-
-
-closest_final_SUPT4H1 = Closest(C[which(C$chr == 17),]$start, 56426497)[1]
-
-higlight_final_SUPT4H1 = C[C$chr == 17 & C$start == closest_final_SUPT4H1,]
-
-CN_baseline_final_SUPT4H1 = round(higlight_final_SUPT4H1$ratio_median/THR,3)
-
-
-
-
-
-# Zone +6: RAD51C - Chromosome 17: 56769934-56812972 (hg19) forward strand.
-
-closest_initial_RAD51C = Closest(B[which(B$chr == 17),]$start, 56791453)[1]
-
-higlight_initial_RAD51C = B[B$chr == 17 & B$start == closest_initial_RAD51C,]
-
-CN_baseline_initial_segment_RAD51C = round(higlight_initial_RAD51C$ratio_median/THR,3)
-
-CN_baseline_initial_point_RAD51C = round(higlight_initial_RAD51C$ratio/THR,3)
-
-
-closest_final_RAD51C = Closest(C[which(C$chr == 17),]$start, 56791453)[1]
-
-higlight_final_RAD51C = C[C$chr == 17 & C$start == closest_final_RAD51C,]
-
-CN_baseline_final_RAD51C = round(higlight_final_RAD51C$ratio_median/THR,3)
-
-
-
-## zone 38: amplifications - chr17	C17orf28	FASN || GALK1	17 	73747550-73761273 (hg19)	428
-
-closest_initial_GALK1 = Closest(B[which(B$chr == 17),]$start, 73754412)[1]
-
-higlight_initial_GALK1 = B[B$chr == 17 & B$start == closest_initial_GALK1,]
-
-CN_baseline_initial_segment_GALK1 = round(higlight_initial_GALK1$ratio_median/THR,3)
-
-CN_baseline_initial_point_GALK1 = round(higlight_initial_GALK1$ratio/THR,3)
-
-
-closest_final_GALK1 = Closest(C[which(C$chr == 17),]$start, 73754412)[1]
-
-higlight_final_GALK1 = C[C$chr == 17 & C$start == closest_final_GALK1,]
-
-CN_baseline_final_GALK1 = round(higlight_final_GALK1$ratio_median/THR,3)
-
-
-
-
-## zone 39: amplifications - chr19	NOTCH3	AKAP8	 || AKAP8	19 15464196-15490598 (hg19)		851
-
-closest_initial_AKAP8 = Closest(B[which(B$chr == 19),]$start, 15477397)[1]
-
-higlight_initial_AKAP8 = B[B$chr == 19 & B$start == closest_initial_AKAP8,]
-
-CN_baseline_initial_segment_AKAP8 = round(higlight_initial_AKAP8$ratio_median/THR,3)
-
-CN_baseline_initial_point_AKAP8 = round(higlight_initial_AKAP8$ratio/THR,3)
-
-
-
-closest_final_AKAP8 = Closest(C[which(C$chr == 19),]$start, 15477397)[1]
-
-higlight_final_AKAP8 = C[C$chr == 19 & C$start == closest_final_AKAP8,]
-
-CN_baseline_final_AKAP8 = round(higlight_final_AKAP8$ratio_median/THR,3)
-
-
-
-
-
-# Zone +7: BRD4 Chromosome 19: 15346330-15443350 (hg19) reverse strand.
-
-closest_initial_BRD4 = Closest(B[which(B$chr == 19),]$start, 15394840)[1]
-
-higlight_initial_BRD4 = B[B$chr == 19 & B$start == closest_initial_BRD4,]
-
-CN_baseline_initial_segment_BRD4 = round(higlight_initial_BRD4$ratio_median/THR,3)
-
-CN_baseline_initial_point_BRD4 = round(higlight_initial_BRD4$ratio/THR,3)
-
-
-
-closest_final_BRD4 = Closest(C[which(C$chr == 19),]$start, 15394840)[1]
-
-higlight_final_BRD4 = C[C$chr == 19 & C$start == closest_final_BRD4,]
-
-CN_baseline_final_BRD4 = round(higlight_final_BRD4$ratio_median/THR,3)
-
-
-
-
-
-# Zone +8: PIK3R2 Chromosome 19: 18263973-18281342 (hg19) forward strand.
-
-closest_initial_PIK3R2 = Closest(B[which(B$chr == 19),]$start, 18272658)[1]
-
-higlight_initial_PIK3R2 = B[B$chr == 19 & B$start == closest_initial_PIK3R2,]
-
-CN_baseline_initial_segment_PIK3R2 = round(higlight_initial_PIK3R2$ratio_median/THR,3)
-
-CN_baseline_initial_point_PIK3R2 = round(higlight_initial_PIK3R2$ratio/THR,3)
-
-
-
-closest_final_PIK3R2 = Closest(C[which(C$chr == 19),]$start, 18272658)[1]
-
-higlight_final_PIK3R2 = C[C$chr == 19 & C$start == closest_final_PIK3R2,]
-
-CN_baseline_final_PIK3R2 = round(higlight_final_PIK3R2$ratio_median/THR,3)
-
-
-
-
-
-# zone +9: CCNE1 Chromosome 19: 30302898-30315219 (hg19) forward strand.
-
-closest_initial_CCNE1 = Closest(B[which(B$chr == 19),]$start, 30309059)[1]
-
-higlight_initial_CCNE1 = B[B$chr == 19 & B$start == closest_initial_CCNE1,]
-
-CN_baseline_initial_segment_CCNE1 = round(higlight_initial_CCNE1$ratio_median/THR,3)
-
-CN_baseline_initial_point_CCNE1 = round(higlight_initial_CCNE1$ratio/THR,3)
-
-
-
-closest_final_CCNE1 = Closest(C[which(C$chr == 19),]$start, 30309059)[1]
-
-higlight_final_CCNE1 = C[C$chr == 19 & C$start == closest_final_CCNE1,]
-
-CN_baseline_final_CCNE1 = round(higlight_final_CCNE1$ratio_median/THR,3)
-
-
-
-
-## zone 40: amplifications - chr19	PIH1D1	ATF5	|| NOSIP	19 50058725-50083813 (hg19)		682
-
-closest_initial_NOSIP = Closest(B[which(B$chr == 19),]$start, 50071269)[1]
-
-higlight_initial_NOSIP = B[B$chr == 19 & B$start == closest_initial_NOSIP,]
-
-CN_baseline_initial_segment_NOSIP = round(higlight_initial_NOSIP$ratio_median/THR,3)
-
-CN_baseline_initial_point_NOSIP = round(higlight_initial_NOSIP$ratio/THR,3)
-
-
-
-closest_final_NOSIP = Closest(C[which(C$chr == 19),]$start, 50071269)[1]
-
-higlight_final_NOSIP = C[C$chr == 19 & C$start == closest_final_NOSIP,]
-
-CN_baseline_final_NOSIP = round(higlight_final_NOSIP$ratio_median/THR,3)
-
-
-
-
-
-## zone 41: amplifications - chr20	CTNNBL1	SYS1	 || C20orf111	20 42824579-42839411 (hg19)		514
-
-closest_initial_C20orf111 = Closest(B[which(B$chr == 20),]$start, 42831995)[1]
-
-higlight_initial_C20orf111 = B[B$chr == 20 & B$start == closest_initial_C20orf111,]
-
-CN_baseline_initial_segment_C20orf111 = round(higlight_initial_C20orf111$ratio_median/THR,3)
-
-CN_baseline_initial_point_C20orf111 = round(higlight_initial_C20orf111$ratio/THR,3)
-
-
-
-closest_final_C20orf111 = Closest(C[which(C$chr == 20),]$start, 42831995)[1]
-
-higlight_final_C20orf111 = C[C$chr == 20 & C$start == closest_final_C20orf111,]
-
-CN_baseline_final_C20orf111 = round(higlight_final_C20orf111$ratio_median/THR,3)
-
-
-
-
-
-## zone 42: amplifications - chr20	TP53RK	SPO11	 ||   ZNF217	20 52183610-52210378 (hg19)		148
-
-closest_initial_ZNF217 = Closest(B[which(B$chr == 20),]$start, 52196994)[1]
-
-higlight_initial_ZNF217 = B[B$chr == 20 & B$start == closest_initial_ZNF217,]
-
-CN_baseline_initial_segment_ZNF217 = round(higlight_initial_ZNF217$ratio_median/THR,3)
-
-CN_baseline_initial_point_ZNF217 = round(higlight_initial_ZNF217$ratio/THR,3)
-
-
-
-closest_final_ZNF217 = Closest(C[which(C$chr == 20),]$start, 52196994)[1]
-
-higlight_final_ZNF217 = C[C$chr == 20 & C$start == closest_final_ZNF217,]
-
-CN_baseline_final_ZNF217 = round(higlight_final_ZNF217$ratio_median/THR,3)
-
-
-
-
-
-
-## zone 42 bis: amplifications - chr20	TP53RK	SPO11	 ||  TSHZ2 Chromosome 20: 51588897-52111869 (hg19) forward strand
-
-closest_initial_TSHZ2 = Closest(B[which(B$chr == 20),]$start, 51850383)[1]
-
-higlight_initial_TSHZ2 = B[B$chr == 20 & B$start == closest_initial_TSHZ2,]
-
-CN_baseline_initial_segment_TSHZ2 = round(higlight_initial_TSHZ2$ratio_median/THR,3)
-
-CN_baseline_initial_point_TSHZ2 = round(higlight_initial_TSHZ2$ratio/THR,3)
-
-
-
-closest_final_TSHZ2 = Closest(C[which(C$chr == 20),]$start, 51850383)[1]
-
-higlight_final_TSHZ2 = C[C$chr == 20 & C$start == closest_final_TSHZ2,]
-
-CN_baseline_final_TSHZ2 = round(higlight_final_TSHZ2$ratio_median/THR,3)
-
-
-
-
-## zone 43: amplifications - chr20	PTK6	C20orf201	 ||  SAMD10	20 62605469-62610995 (hg19)  	487
-
-closest_initial_SAMD10 = Closest(B[which(B$chr == 20),]$start, 62608232)[1]
-
-higlight_initial_SAMD10 = B[B$chr == 20 & B$start == closest_initial_SAMD10,]
-
-CN_baseline_initial_segment_SAMD10 = round(higlight_initial_SAMD10$ratio_median/THR,3)
-
-CN_baseline_initial_point_SAMD10 = round(higlight_initial_SAMD10$ratio/THR,3)
-
-
-
-closest_final_SAMD10 = Closest(C[which(C$chr == 20),]$start, 62608232)[1]
-
-higlight_final_SAMD10 = C[C$chr == 20 & C$start == closest_final_SAMD10,]
-
-CN_baseline_final_SAMD10 = round(higlight_final_SAMD10$ratio_median/THR,3)
-
-
-
-
-## zone 44: amplifications - chr21	C21orf57	PCNT || PCNT	21	47744070-47865682 (hg19)	1099
-
-closest_initial_PCNT = Closest(B[which(B$chr == 21),]$start, 47804876)[1]
-
-higlight_initial_PCNT = B[B$chr == 21 & B$start == closest_initial_PCNT,]
-
-CN_baseline_initial_segment_PCNT = round(higlight_initial_PCNT$ratio_median/THR,3)
-
-CN_baseline_initial_point_PCNT = round(higlight_initial_PCNT$ratio/THR,3)
-
-
-closest_final_PCNT = Closest(C[which(C$chr == 21),]$start, 47804876)[1]
-
-higlight_final_PCNT = C[C$chr == 21 & C$start == closest_final_PCNT,]
-
-CN_baseline_final_PCNT = round(higlight_final_PCNT$ratio_median/THR,3)
-
-
-
-### Table sum-up
-
-
-gene = c("DOCK7", "HCN3", "KLHL12", "RBBP5", "TSC22D2", "PIK3CA", "ANKRD17", "CDKN2AIP", "RTN4IP1", "AIM1",
-         "INTS10", "PPP2R2A", "BRF2", "ZNF703", "MYC", "CD274_PDL1", "MTAP", "SEPHS1", "ZMIZ1", "WAPAL", "PTEN",
-         "CSTF3", "BBS1", "CTTN", "CCND1", "ATG16L2", "INTS4", "CCDC77", "FOXM1", "YEATS4", "MDM2", "BRCA2", "C13orf23",
-         "TRIM13", "SDCCAG1", "SNAP23", "IGF1R", "CYB5B", "P53", "ELAC2", "MAP2K4", "ERAL1", "NF1", "ERBB2", "BRCA1", "PHB",
-         "SUPT4H1", "RAD51C", "GALK1", "AKAP8", "BRD4", "PIK3R2", "CCNE1", "NOSIP", "C20orf111", "ZNF217",
-         "TSHZ2", "SAMD10", "PCNT")
-
-
-chr = c(higlight_initial_DOCK7$chr, higlight_initial_HCN3$chr, higlight_initial_KLHL12$chr, higlight_initial_RBBP5$chr,
-        higlight_initial_TSC22D2$chr, higlight_initial_PIK3CA$chr, higlight_initial_ANKRD17$chr, higlight_initial_CDKN2AIP$chr,
-        higlight_initial_RTN4IP1$chr, higlight_initial_AIM1$chr, higlight_initial_INTS10$chr,
-        higlight_initial_PPP2R2A$chr, higlight_initial_BRF2$chr, higlight_initial_ZNF703$chr,
-        higlight_initial_MYC$chr, higlight_initial_CD274_PDL1$chr, higlight_initial_MTAP$chr, higlight_initial_SEPHS1$chr,
-        higlight_initial_ZMIZ1$chr, higlight_initial_WAPAL$chr, higlight_initial_PTEN$chr, higlight_initial_CSTF3$chr,
-        higlight_initial_BBS1$chr, higlight_initial_CTTN$chr, higlight_initial_CCND1$chr, higlight_initial_ATG16L2$chr,
-        higlight_initial_INTS4$chr, higlight_initial_CCDC77$chr, higlight_initial_FOXM1$chr, higlight_initial_YEATS4$chr,
-        higlight_initial_MDM2$chr, higlight_initial_BRCA2$chr, higlight_initial_C13orf23$chr, higlight_initial_TRIM13$chr,
-        higlight_initial_SDCCAG1$chr, higlight_initial_SNAP23$chr, higlight_initial_IGF1R$chr, higlight_initial_CYB5B$chr,
-        higlight_initial_P53$chr, higlight_initial_ELAC2$chr, higlight_initial_MAP2K4$chr, higlight_initial_ERAL1$chr,
-        higlight_initial_NF1$chr, higlight_initial_ERBB2$chr, higlight_initial_BRCA1$chr, higlight_initial_PHB$chr,
-        higlight_initial_SUPT4H1$chr, higlight_initial_RAD51C$chr, higlight_initial_GALK1$chr,
-        higlight_initial_AKAP8$chr, higlight_initial_BRD4$chr, higlight_initial_PIK3R2$chr, higlight_initial_CCNE1$chr,
-        higlight_initial_NOSIP$chr, higlight_initial_C20orf111$chr, higlight_initial_ZNF217$chr, higlight_initial_TSHZ2$chr,
-        higlight_initial_SAMD10$chr, higlight_initial_PCNT$chr)
-
-
-start = c(higlight_initial_DOCK7$start, higlight_initial_HCN3$start, higlight_initial_KLHL12$start, higlight_initial_RBBP5$start,
-          higlight_initial_TSC22D2$start, higlight_initial_PIK3CA$start, higlight_initial_ANKRD17$start, higlight_initial_CDKN2AIP$start,
-          higlight_initial_RTN4IP1$start, higlight_initial_AIM1$start, higlight_initial_INTS10$start,
-          higlight_initial_PPP2R2A$start, higlight_initial_BRF2$start, higlight_initial_ZNF703$start,
-          higlight_initial_MYC$start, higlight_initial_CD274_PDL1$start, higlight_initial_MTAP$start, higlight_initial_SEPHS1$start,
-          higlight_initial_ZMIZ1$start, higlight_initial_WAPAL$start, higlight_initial_PTEN$start, higlight_initial_CSTF3$start,
-          higlight_initial_BBS1$start, higlight_initial_CTTN$start, higlight_initial_CCND1$start, higlight_initial_ATG16L2$start,
-          higlight_initial_INTS4$start, higlight_initial_CCDC77$start, higlight_initial_FOXM1$start, higlight_initial_YEATS4$start,
-          higlight_initial_MDM2$start, higlight_initial_BRCA2$start, higlight_initial_C13orf23$start, higlight_initial_TRIM13$start,
-          higlight_initial_SDCCAG1$start, higlight_initial_SNAP23$start, higlight_initial_IGF1R$start, higlight_initial_CYB5B$start,
-          higlight_initial_P53$start, higlight_initial_ELAC2$start, higlight_initial_MAP2K4$start, higlight_initial_ERAL1$start,
-          higlight_initial_NF1$start, higlight_initial_ERBB2$start, higlight_initial_BRCA1$start, higlight_initial_PHB$start,
-          higlight_initial_SUPT4H1$start, higlight_initial_RAD51C$start, higlight_initial_GALK1$start,
-          higlight_initial_AKAP8$start, higlight_initial_BRD4$start, higlight_initial_PIK3R2$start, higlight_initial_CCNE1$start,
-          higlight_initial_NOSIP$start, higlight_initial_C20orf111$start, higlight_initial_ZNF217$start, higlight_initial_TSHZ2$start,
-          higlight_initial_SAMD10$start, higlight_initial_PCNT$start)
-
-
-ratio_point_initial = c(higlight_initial_DOCK7$ratio, higlight_initial_HCN3$ratio, higlight_initial_KLHL12$ratio, higlight_initial_RBBP5$ratio,
-                        higlight_initial_TSC22D2$ratio, higlight_initial_PIK3CA$ratio, higlight_initial_ANKRD17$ratio, higlight_initial_CDKN2AIP$ratio,
-                        higlight_initial_RTN4IP1$ratio, higlight_initial_AIM1$ratio, higlight_initial_INTS10$ratio,
-                        higlight_initial_PPP2R2A$ratio, higlight_initial_BRF2$ratio, higlight_initial_ZNF703$ratio,
-                        higlight_initial_MYC$ratio, higlight_initial_CD274_PDL1$ratio, higlight_initial_MTAP$ratio, higlight_initial_SEPHS1$ratio,
-                        higlight_initial_ZMIZ1$ratio, higlight_initial_WAPAL$ratio, higlight_initial_PTEN$ratio, higlight_initial_CSTF3$ratio,
-                        higlight_initial_BBS1$ratio, higlight_initial_CTTN$ratio, higlight_initial_CCND1$ratio, higlight_initial_ATG16L2$ratio,
-                        higlight_initial_INTS4$ratio, higlight_initial_CCDC77$ratio, higlight_initial_FOXM1$ratio, higlight_initial_YEATS4$ratio,
-                        higlight_initial_MDM2$ratio, higlight_initial_BRCA2$ratio, higlight_initial_C13orf23$ratio, higlight_initial_TRIM13$ratio,
-                        higlight_initial_SDCCAG1$ratio, higlight_initial_SNAP23$ratio, higlight_initial_IGF1R$ratio, higlight_initial_CYB5B$ratio,
-                        higlight_initial_P53$ratio, higlight_initial_ELAC2$ratio, higlight_initial_MAP2K4$ratio, higlight_initial_ERAL1$ratio,
-                        higlight_initial_NF1$ratio, higlight_initial_ERBB2$ratio, higlight_initial_BRCA1$ratio, higlight_initial_PHB$ratio,
-                        higlight_initial_SUPT4H1$ratio, higlight_initial_RAD51C$ratio, higlight_initial_GALK1$ratio,
-                        higlight_initial_AKAP8$ratio, higlight_initial_BRD4$ratio, higlight_initial_PIK3R2$ratio, higlight_initial_CCNE1$ratio,
-                        higlight_initial_NOSIP$ratio, higlight_initial_C20orf111$ratio, higlight_initial_ZNF217$ratio, higlight_initial_TSHZ2$ratio,
-                        higlight_initial_SAMD10$ratio, higlight_initial_PCNT$ratio)
-
-CN_to_baseline_point_initial = c(CN_baseline_initial_point_DOCK7, CN_baseline_initial_point_HCN3, CN_baseline_initial_point_KLHL12, CN_baseline_initial_point_RBBP5,
-                                 CN_baseline_initial_point_TSC22D2, CN_baseline_initial_point_PIK3CA, CN_baseline_initial_point_ANKRD17, CN_baseline_initial_point_CDKN2AIP,
-                                 CN_baseline_initial_point_RTN4IP1, CN_baseline_initial_point_AIM1, CN_baseline_initial_point_INTS10,
-                                 CN_baseline_initial_point_PPP2R2A, CN_baseline_initial_point_BRF2, CN_baseline_initial_point_ZNF703,
-                                 CN_baseline_initial_point_MYC, CN_baseline_initial_point_CD274_PDL1, CN_baseline_initial_point_MTAP, CN_baseline_initial_point_SEPHS1,
-                                 CN_baseline_initial_point_ZMIZ1, CN_baseline_initial_point_WAPAL, CN_baseline_initial_point_PTEN, CN_baseline_initial_point_CSTF3,
-                                 CN_baseline_initial_point_BBS1, CN_baseline_initial_point_CTTN, CN_baseline_initial_point_CCND1, CN_baseline_initial_point_ATG16L2,
-                                 CN_baseline_initial_point_INTS4, CN_baseline_initial_point_CCDC77, CN_baseline_initial_point_FOXM1, CN_baseline_initial_point_YEATS4,
-                                 CN_baseline_initial_point_MDM2, CN_baseline_initial_point_BRCA2, CN_baseline_initial_point_C13orf23, CN_baseline_initial_point_TRIM13,
-                                 CN_baseline_initial_point_SDCCAG1, CN_baseline_initial_point_SNAP23, CN_baseline_initial_point_IGF1R, CN_baseline_initial_point_CYB5B,
-                                 CN_baseline_initial_point_P53, CN_baseline_initial_point_ELAC2, CN_baseline_initial_point_MAP2K4, CN_baseline_initial_point_ERAL1,
-                                 CN_baseline_initial_point_NF1, CN_baseline_initial_point_ERBB2, CN_baseline_initial_point_BRCA1, CN_baseline_initial_point_PHB,
-                                 CN_baseline_initial_point_SUPT4H1, CN_baseline_initial_point_RAD51C, CN_baseline_initial_point_GALK1,
-                                 CN_baseline_initial_point_AKAP8, CN_baseline_initial_point_BRD4, CN_baseline_initial_point_PIK3R2, CN_baseline_initial_point_CCNE1,
-                                 CN_baseline_initial_point_NOSIP, CN_baseline_initial_point_C20orf111, CN_baseline_initial_point_ZNF217, CN_baseline_initial_point_TSHZ2,
-                                 CN_baseline_initial_point_SAMD10, CN_baseline_initial_point_PCNT)
-
-
-ratio_segment_initial = c(higlight_initial_DOCK7$ratio_median, higlight_initial_HCN3$ratio_median, higlight_initial_KLHL12$ratio_median, higlight_initial_RBBP5$ratio_median,
-                          higlight_initial_TSC22D2$ratio_median, higlight_initial_PIK3CA$ratio_median, higlight_initial_ANKRD17$ratio_median, higlight_initial_CDKN2AIP$ratio_median,
-                          higlight_initial_RTN4IP1$ratio_median, higlight_initial_AIM1$ratio_median, higlight_initial_INTS10$ratio_median,
-                          higlight_initial_PPP2R2A$ratio_median, higlight_initial_BRF2$ratio_median, higlight_initial_ZNF703$ratio_median,
-                          higlight_initial_MYC$ratio_median, higlight_initial_CD274_PDL1$ratio_median, higlight_initial_MTAP$ratio_median, higlight_initial_SEPHS1$ratio_median,
-                          higlight_initial_ZMIZ1$ratio_median, higlight_initial_WAPAL$ratio_median, higlight_initial_PTEN$ratio_median, higlight_initial_CSTF3$ratio_median,
-                          higlight_initial_BBS1$ratio_median, higlight_initial_CTTN$ratio_median, higlight_initial_CCND1$ratio_median, higlight_initial_ATG16L2$ratio_median,
-                          higlight_initial_INTS4$ratio_median, higlight_initial_CCDC77$ratio_median, higlight_initial_FOXM1$ratio_median, higlight_initial_YEATS4$ratio_median,
-                          higlight_initial_MDM2$ratio_median, higlight_initial_BRCA2$ratio_median, higlight_initial_C13orf23$ratio_median, higlight_initial_TRIM13$ratio_median,
-                          higlight_initial_SDCCAG1$ratio_median, higlight_initial_SNAP23$ratio_median, higlight_initial_IGF1R$ratio_median, higlight_initial_CYB5B$ratio_median,
-                          higlight_initial_P53$ratio_median, higlight_initial_ELAC2$ratio_median, higlight_initial_MAP2K4$ratio_median, higlight_initial_ERAL1$ratio_median,
-                          higlight_initial_NF1$ratio_median, higlight_initial_ERBB2$ratio_median, higlight_initial_BRCA1$ratio_median, higlight_initial_PHB$ratio_median,
-                          higlight_initial_SUPT4H1$ratio_median, higlight_initial_RAD51C$ratio_median, higlight_initial_GALK1$ratio_median,
-                          higlight_initial_AKAP8$ratio_median, higlight_initial_BRD4$ratio_median, higlight_initial_PIK3R2$ratio_median, higlight_initial_CCNE1$ratio_median,
-                          higlight_initial_NOSIP$ratio_median, higlight_initial_C20orf111$ratio_median, higlight_initial_ZNF217$ratio_median, higlight_initial_TSHZ2$ratio_median,
-                          higlight_initial_SAMD10$ratio_median, higlight_initial_PCNT$ratio_median)
-
-CN_to_baseline_segment_initial = c(CN_baseline_initial_segment_DOCK7, CN_baseline_initial_segment_HCN3, CN_baseline_initial_segment_KLHL12, CN_baseline_initial_segment_RBBP5,
-                                   CN_baseline_initial_segment_TSC22D2, CN_baseline_initial_segment_PIK3CA, CN_baseline_initial_segment_ANKRD17, CN_baseline_initial_segment_CDKN2AIP,
-                                   CN_baseline_initial_segment_RTN4IP1, CN_baseline_initial_segment_AIM1, CN_baseline_initial_segment_INTS10,
-                                   CN_baseline_initial_segment_PPP2R2A, CN_baseline_initial_segment_BRF2, CN_baseline_initial_segment_ZNF703,
-                                   CN_baseline_initial_segment_MYC, CN_baseline_initial_segment_CD274_PDL1, CN_baseline_initial_segment_MTAP, CN_baseline_initial_segment_SEPHS1,
-                                   CN_baseline_initial_segment_ZMIZ1, CN_baseline_initial_segment_WAPAL, CN_baseline_initial_segment_PTEN, CN_baseline_initial_segment_CSTF3,
-                                   CN_baseline_initial_segment_BBS1, CN_baseline_initial_segment_CTTN, CN_baseline_initial_segment_CCND1, CN_baseline_initial_segment_ATG16L2,
-                                   CN_baseline_initial_segment_INTS4, CN_baseline_initial_segment_CCDC77, CN_baseline_initial_segment_FOXM1, CN_baseline_initial_segment_YEATS4,
-                                   CN_baseline_initial_segment_MDM2, CN_baseline_initial_segment_BRCA2, CN_baseline_initial_segment_C13orf23, CN_baseline_initial_segment_TRIM13,
-                                   CN_baseline_initial_segment_SDCCAG1, CN_baseline_initial_segment_SNAP23, CN_baseline_initial_segment_IGF1R, CN_baseline_initial_segment_CYB5B,
-                                   CN_baseline_initial_segment_P53, CN_baseline_initial_segment_ELAC2, CN_baseline_initial_segment_MAP2K4, CN_baseline_initial_segment_ERAL1,
-                                   CN_baseline_initial_segment_NF1, CN_baseline_initial_segment_ERBB2, CN_baseline_initial_segment_BRCA1, CN_baseline_initial_segment_PHB,
-                                   CN_baseline_initial_segment_SUPT4H1, CN_baseline_initial_segment_RAD51C, CN_baseline_initial_segment_GALK1,
-                                   CN_baseline_initial_segment_AKAP8, CN_baseline_initial_segment_BRD4, CN_baseline_initial_segment_PIK3R2, CN_baseline_initial_segment_CCNE1,
-                                   CN_baseline_initial_segment_NOSIP, CN_baseline_initial_segment_C20orf111, CN_baseline_initial_segment_ZNF217, CN_baseline_initial_segment_TSHZ2,
-                                   CN_baseline_initial_segment_SAMD10, CN_baseline_initial_segment_PCNT)
-
-
-
-ratio_segment_final = c(higlight_final_DOCK7$ratio_median, higlight_final_HCN3$ratio_median, higlight_final_KLHL12$ratio_median, higlight_final_RBBP5$ratio_median,
-                        higlight_final_TSC22D2$ratio_median, higlight_final_PIK3CA$ratio_median, higlight_final_ANKRD17$ratio_median, higlight_final_CDKN2AIP$ratio_median,
-                        higlight_final_RTN4IP1$ratio_median, higlight_final_AIM1$ratio_median, higlight_final_INTS10$ratio_median,
-                        higlight_final_PPP2R2A$ratio_median, higlight_final_BRF2$ratio_median, higlight_final_ZNF703$ratio_median,
-                        higlight_final_MYC$ratio_median, higlight_final_CD274_PDL1$ratio_median, higlight_final_MTAP$ratio_median, higlight_final_SEPHS1$ratio_median,
-                        higlight_final_ZMIZ1$ratio_median, higlight_final_WAPAL$ratio_median, higlight_final_PTEN$ratio_median, higlight_final_CSTF3$ratio_median,
-                        higlight_final_BBS1$ratio_median, higlight_final_CTTN$ratio_median, higlight_final_CCND1$ratio_median, higlight_final_ATG16L2$ratio_median,
-                        higlight_final_INTS4$ratio_median, higlight_final_CCDC77$ratio_median, higlight_final_FOXM1$ratio_median, higlight_final_YEATS4$ratio_median,
-                        higlight_final_MDM2$ratio_median, higlight_final_BRCA2$ratio_median, higlight_final_C13orf23$ratio_median, higlight_final_TRIM13$ratio_median,
-                        higlight_final_SDCCAG1$ratio_median, higlight_final_SNAP23$ratio_median, higlight_final_IGF1R$ratio_median, higlight_final_CYB5B$ratio_median,
-                        higlight_final_P53$ratio_median, higlight_final_ELAC2$ratio_median, higlight_final_MAP2K4$ratio_median, higlight_final_ERAL1$ratio_median,
-                        higlight_final_NF1$ratio_median, higlight_final_ERBB2$ratio_median, higlight_final_BRCA1$ratio_median, higlight_final_PHB$ratio_median,
-                        higlight_final_SUPT4H1$ratio_median, higlight_final_RAD51C$ratio_median, higlight_final_GALK1$ratio_median,
-                        higlight_final_AKAP8$ratio_median, higlight_final_BRD4$ratio_median, higlight_final_PIK3R2$ratio_median, higlight_final_CCNE1$ratio_median,
-                        higlight_final_NOSIP$ratio_median, higlight_final_C20orf111$ratio_median, higlight_final_ZNF217$ratio_median, higlight_final_TSHZ2$ratio_median,
-                        higlight_final_SAMD10$ratio_median, higlight_final_PCNT$ratio_median)
-
-CN_to_baseline_segment_final = c(CN_baseline_final_DOCK7, CN_baseline_final_HCN3, CN_baseline_final_KLHL12, CN_baseline_final_RBBP5,
-                                 CN_baseline_final_TSC22D2, CN_baseline_final_PIK3CA, CN_baseline_final_ANKRD17, CN_baseline_final_CDKN2AIP,
-                                 CN_baseline_final_RTN4IP1, CN_baseline_final_AIM1, CN_baseline_final_INTS10,
-                                 CN_baseline_final_PPP2R2A, CN_baseline_final_BRF2, CN_baseline_final_ZNF703,
-                                 CN_baseline_final_MYC, CN_baseline_final_CD274_PDL1, CN_baseline_final_MTAP, CN_baseline_final_SEPHS1,
-                                 CN_baseline_final_ZMIZ1, CN_baseline_final_WAPAL, CN_baseline_final_PTEN, CN_baseline_final_CSTF3,
-                                 CN_baseline_final_BBS1, CN_baseline_final_CTTN, CN_baseline_final_CCND1, CN_baseline_final_ATG16L2,
-                                 CN_baseline_final_INTS4, CN_baseline_final_CCDC77, CN_baseline_final_FOXM1, CN_baseline_final_YEATS4,
-                                 CN_baseline_final_MDM2, CN_baseline_final_BRCA2, CN_baseline_final_C13orf23, CN_baseline_final_TRIM13,
-                                 CN_baseline_final_SDCCAG1, CN_baseline_final_SNAP23, CN_baseline_final_IGF1R, CN_baseline_final_CYB5B,
-                                 CN_baseline_final_P53, CN_baseline_final_ELAC2, CN_baseline_final_MAP2K4, CN_baseline_final_ERAL1,
-                                 CN_baseline_final_NF1, CN_baseline_final_ERBB2, CN_baseline_final_BRCA1, CN_baseline_final_PHB,
-                                 CN_baseline_final_SUPT4H1, CN_baseline_final_RAD51C, CN_baseline_final_GALK1,
-                                 CN_baseline_final_AKAP8, CN_baseline_final_BRD4, CN_baseline_final_PIK3R2, CN_baseline_final_CCNE1,
-                                 CN_baseline_final_NOSIP, CN_baseline_final_C20orf111, CN_baseline_final_ZNF217, CN_baseline_final_TSHZ2,
-                                 CN_baseline_final_SAMD10, CN_baseline_final_PCNT)
-
-amplification_deletion_table = data.frame(gene, chr, start, ratio_point_initial, CN_to_baseline_point_initial,
-                                          ratio_segment_initial, CN_to_baseline_segment_initial, ratio_segment_final,
-                                          CN_to_baseline_segment_final)
+gene_list <- load_gene_list(custom_gene_file)
+lookup_gene_table <- lookup_gene_ratios(gene_list, B, C, THR)
+
+amplification_deletion_table = data.frame(
+  gene = lookup_gene_table$gene,
+  chr = lookup_gene_table$chr,
+  start = lookup_gene_table$start,
+  ratio_point_initial = lookup_gene_table$ratio_point_initial,
+  CN_to_baseline_point_initial = lookup_gene_table$CN_point_initial,
+  ratio_segment_initial = lookup_gene_table$ratio_segment_initial,
+  CN_to_baseline_segment_initial = lookup_gene_table$CN_segment_initial,
+  ratio_segment_final = lookup_gene_table$ratio_segment_final,
+  CN_to_baseline_segment_final = lookup_gene_table$CN_segment_final
+)
 
 write.table(amplification_deletion_table, file = paste0(outputPath,"/",NAMEEE,"_amplification_deletion_table.txt"), sep = "\t", row.names = FALSE)
 
@@ -5432,6 +4147,10 @@ colnames(B) <- c("chr", "start", "end", "ratio", "ratio_median")
 
 B = B[which(B$chr != 23),]
 
+# Plot-only highlighting for key HRD genes (not written to output table)
+hrd_genes <- c("BRCA1", "BRCA2", "RAD51C", "CDKN2AIP", "PIK3CA", "MYC", "CD274_PDL1", "PTEN", "CCND1", "CCNE1", "NF1", "ERBB2")
+amplification_deletion_table$label_color <- ifelse(amplification_deletion_table$gene %in% hrd_genes, "red", "black")
+
 Z <- ggplot() +
   geom_rect(data=df, aes(xmin=start, xmax=end, ymin=-Inf, ymax=Inf, fill = chr %% 2 == 0)) +
   geom_point(data=B, aes(x = start, y = ratio), size=0.1, color= "grey60") + ggtitle(NAMEEE) +
@@ -5439,14 +4158,11 @@ Z <- ggplot() +
                                                                                                    mapping=aes(xintercept=start_centromere), color="black", linetype="dotted") +
   geom_point(data=amplification_deletion_table, aes(x=start, y=ratio_segment_initial), color = "orange", size = 2) +
   coord_cartesian(clip = "off") +
-  geom_text_repel(data = amplification_deletion_table, mapping = aes(x = start, y = ratio_segment_initial, label = gene, size = 7, fontface = 'bold'),
+  geom_text_repel(data = amplification_deletion_table,
+                  mapping = aes(x = start, y = ratio_segment_initial, label = gene, size = 7, fontface = 'bold', color = label_color),
                   min.segment.length = 0, box.padding = 2, xlim = c(-Inf, NA),
-                  color = ifelse(amplification_deletion_table$gene == "BRCA1" | amplification_deletion_table$gene == "BRCA2" |
-                                   amplification_deletion_table$gene == "RAD51C" | amplification_deletion_table$gene == "CDKN2AIP" | amplification_deletion_table$gene == "PIK3CA" |
-                                   amplification_deletion_table$gene == "MYC" | amplification_deletion_table$gene == "CD274_PDL1" | amplification_deletion_table$gene == "PTEN" |
-                                   amplification_deletion_table$gene == "CCND1" | amplification_deletion_table$gene == "CCNE1" |
-                                   amplification_deletion_table$gene == "NF1" | amplification_deletion_table$gene == "ERBB2", "red", "black"),
                   ylim = c(-Inf, Inf), max.overlaps = Inf, max.iter = Inf, max.time = 60, force = 30) +
+  scale_color_identity() +
   geom_text(aes(x=start,y=higher_limit_graphe, hjust = "left", vjust = "top", label = chr), data = df, fontface = "bold", size = 4.5) +
   scale_fill_manual(values = c("FALSE" = "grey85", "TRUE" = "white")) +
   facet_grid(~chr, scales = "free_x", space = "free_x", switch = "x")
